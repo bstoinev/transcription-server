@@ -1,32 +1,46 @@
-using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using AIO.Transcription.Server.Audio;
 using AIO.Transcription.Server.Contracts.Protocol;
+using AIO.Transcription.Server.Runtime;
+using AIO.Transcription.Server.Transcription;
 
 var builder = WebApplication.CreateBuilder(args);
+
+builder.Logging.ClearProviders();
+builder.Logging.AddSimpleConsole(options =>
+{
+    options.TimestampFormat = "HH:mm:ss ";
+    options.SingleLine = true;
+});
+
+var whisperOptions = new WhisperTranscriberOptions();
+builder.Configuration.GetSection("Transcription").Bind(whisperOptions);
 
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
     options.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
     options.SerializerOptions.WriteIndented = true;
 });
-
-builder.Services.AddSingleton<TranscriptionSessionStore>();
+builder.Services.AddSingleton(whisperOptions);
+builder.Services.AddSingleton<IWaveTranscriber, WhisperCppTranscriber>();
+builder.Services.AddSingleton<SessionRegistry>();
 
 var app = builder.Build();
-
 app.UseWebSockets();
 
 app.MapGet("/", () => Results.Redirect("/healthz"));
-app.MapGet("/healthz", () => Results.Ok(new
+app.MapGet("/healthz", (WhisperTranscriberOptions options) => Results.Ok(new
 {
     service = "AIO.Transcription.Server",
     status = "ok",
-    timeUtc = DateTimeOffset.UtcNow
+    timeUtc = DateTimeOffset.UtcNow,
+    minimumWindowMilliseconds = options.MinimumWindowMilliseconds,
+    modelType = options.ModelType,
+    targetSampleRate = options.TargetSampleRate
 }));
-
-app.MapGet("/sessions", (TranscriptionSessionStore store) => Results.Ok(store.GetAll()));
+app.MapGet("/sessions", (SessionRegistry registry) => Results.Ok(registry.GetAll()));
 
 app.Map("/ws/transcribe", async context =>
 {
@@ -37,35 +51,47 @@ app.Map("/ws/transcribe", async context =>
         return;
     }
 
+    var registry = context.RequestServices.GetRequiredService<SessionRegistry>();
     using var socket = await context.WebSockets.AcceptWebSocketAsync();
-    var store = context.RequestServices.GetRequiredService<TranscriptionSessionStore>();
-    var buffer = new byte[1024 * 64];
+    var buffer = new byte[64 * 1024];
     string currentSessionId = string.Empty;
 
     await SendAsync(socket, new ServerEnvelope
     {
         Type = "server-ready",
         Message = "Connected. Send start-session first."
-    });
+    }, context.RequestAborted);
 
-    while (socket.State == WebSocketState.Open)
+    while (socket.State == WebSocketState.Open && !context.RequestAborted.IsCancellationRequested)
     {
-        var result = await socket.ReceiveAsync(buffer, context.RequestAborted);
-        if (result.MessageType == WebSocketMessageType.Close)
+        var message = await ReceiveMessageAsync(socket, buffer, context.RequestAborted);
+        if (message is null)
         {
-            await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", context.RequestAborted);
             break;
         }
 
-        var message = await ReadMessageAsync(socket, buffer, result, context.RequestAborted);
-        var clientEnvelope = JsonSerializer.Deserialize<ClientEnvelope>(message, JsonOptions.Default);
+        ClientEnvelope? clientEnvelope;
+        try
+        {
+            clientEnvelope = JsonSerializer.Deserialize<ClientEnvelope>(message, JsonOptions.Default);
+        }
+        catch (JsonException ex)
+        {
+            await SendAsync(socket, new ServerEnvelope
+            {
+                Type = "error",
+                Message = $"Invalid JSON envelope: {ex.Message}"
+            }, context.RequestAborted);
+            continue;
+        }
+
         if (clientEnvelope is null)
         {
             await SendAsync(socket, new ServerEnvelope
             {
                 Type = "error",
-                Message = "Invalid JSON envelope."
-            });
+                Message = "Empty JSON envelope."
+            }, context.RequestAborted);
             continue;
         }
 
@@ -76,86 +102,99 @@ app.Map("/ws/transcribe", async context =>
             case "start-session":
                 if (string.IsNullOrWhiteSpace(clientEnvelope.SessionId))
                 {
-                    await SendAsync(socket, new ServerEnvelope
-                    {
-                        Type = "error",
-                        Message = "sessionId is required for start-session."
-                    });
+                    await SendAsync(socket, new ServerEnvelope { Type = "error", Message = "sessionId is required for start-session." }, context.RequestAborted);
                     continue;
                 }
 
-                var snapshot = store.StartOrUpdate(clientEnvelope.SessionId, clientEnvelope.Encoding, clientEnvelope.SampleRate, clientEnvelope.Channels, 0);
+                var started = registry.GetOrCreate(clientEnvelope.SessionId);
                 await SendAsync(socket, new ServerEnvelope
                 {
                     Type = "session-started",
-                    SessionId = snapshot.SessionId,
+                    SessionId = started.SessionId,
                     Message = "Session registered.",
-                    ReceivedChunkCount = snapshot.ReceivedChunkCount,
-                    ReceivedAudioBytes = snapshot.ReceivedAudioBytes
-                });
+                    ReceivedChunkCount = started.Snapshot.ReceivedChunkCount,
+                    ReceivedAudioBytes = started.Snapshot.ReceivedAudioBytes,
+                }, context.RequestAborted);
                 break;
 
             case "audio-chunk":
                 if (string.IsNullOrWhiteSpace(currentSessionId))
                 {
-                    await SendAsync(socket, new ServerEnvelope
-                    {
-                        Type = "error",
-                        Message = "No active session. Send start-session first."
-                    });
+                    await SendAsync(socket, new ServerEnvelope { Type = "error", Message = "No active session. Send start-session first." }, context.RequestAborted);
                     continue;
                 }
 
-                var bytes = 0L;
-                if (!string.IsNullOrWhiteSpace(clientEnvelope.AudioBase64))
+                if (string.IsNullOrWhiteSpace(clientEnvelope.AudioBase64))
                 {
-                    try
-                    {
-                        bytes = Convert.FromBase64String(clientEnvelope.AudioBase64).LongLength;
-                    }
-                    catch (FormatException)
-                    {
-                        await SendAsync(socket, new ServerEnvelope
-                        {
-                            Type = "error",
-                            SessionId = currentSessionId,
-                            Message = "audioBase64 is not valid base64."
-                        });
-                        continue;
-                    }
+                    await SendAsync(socket, new ServerEnvelope { Type = "error", SessionId = currentSessionId, Message = "audioBase64 is required for audio-chunk." }, context.RequestAborted);
+                    continue;
                 }
 
-                var updated = store.StartOrUpdate(currentSessionId, clientEnvelope.Encoding, clientEnvelope.SampleRate, clientEnvelope.Channels, bytes);
+                byte[] audioBytes;
+                try
+                {
+                    audioBytes = Convert.FromBase64String(clientEnvelope.AudioBase64);
+                }
+                catch (FormatException)
+                {
+                    await SendAsync(socket, new ServerEnvelope { Type = "error", SessionId = currentSessionId, Message = "audioBase64 is not valid base64." }, context.RequestAborted);
+                    continue;
+                }
+
+                var session = registry.GetOrCreate(currentSessionId);
+                var update = await session.AddAudioChunkAsync(new AudioChunk(
+                    audioBytes,
+                    audioBytes.Length,
+                    clientEnvelope.SampleRate ?? 48000,
+                    clientEnvelope.Channels ?? 2,
+                    clientEnvelope.Encoding ?? "f32le",
+                    DateTimeOffset.UtcNow), context.RequestAborted);
+
                 await SendAsync(socket, new ServerEnvelope
                 {
                     Type = "audio-ack",
-                    SessionId = updated.SessionId,
+                    SessionId = currentSessionId,
                     Message = "Audio chunk received.",
-                    ReceivedChunkCount = updated.ReceivedChunkCount,
-                    ReceivedAudioBytes = updated.ReceivedAudioBytes
-                });
+                    ReceivedChunkCount = session.Snapshot.ReceivedChunkCount,
+                    ReceivedAudioBytes = session.Snapshot.ReceivedAudioBytes,
+                }, context.RequestAborted);
+
+                if (update is not null)
+                {
+                    await SendAsync(socket, update, context.RequestAborted);
+                }
                 break;
 
             case "simulate-text":
                 if (string.IsNullOrWhiteSpace(currentSessionId))
                 {
-                    await SendAsync(socket, new ServerEnvelope
-                    {
-                        Type = "error",
-                        Message = "No active session. Send start-session first."
-                    });
+                    await SendAsync(socket, new ServerEnvelope { Type = "error", Message = "No active session. Send start-session first." }, context.RequestAborted);
                     continue;
                 }
 
-                store.StartOrUpdate(currentSessionId, clientEnvelope.Encoding, clientEnvelope.SampleRate, clientEnvelope.Channels, 0);
+                registry.GetOrCreate(currentSessionId);
                 await SendAsync(socket, new ServerEnvelope
                 {
                     Type = "transcript",
                     SessionId = currentSessionId,
                     Message = "Simulated transcript event.",
                     TranscriptText = clientEnvelope.SimulatedText ?? string.Empty,
-                    IsFinal = clientEnvelope.IsFinalChunk ?? true
-                });
+                    IsFinal = clientEnvelope.IsFinalChunk ?? true,
+                }, context.RequestAborted);
+                break;
+
+            case "end-session":
+                if (string.IsNullOrWhiteSpace(currentSessionId))
+                {
+                    await SendAsync(socket, new ServerEnvelope { Type = "error", Message = "No active session to end." }, context.RequestAborted);
+                    continue;
+                }
+
+                var removed = registry.Remove(currentSessionId);
+                await SendAsync(socket,
+                    removed?.BuildEndedEnvelope() ?? new ServerEnvelope { Type = "session-ended", SessionId = currentSessionId, Message = "Session ended." },
+                    context.RequestAborted);
+                currentSessionId = string.Empty;
                 break;
 
             default:
@@ -164,72 +203,42 @@ app.Map("/ws/transcribe", async context =>
                     Type = "error",
                     SessionId = currentSessionId,
                     Message = $"Unsupported message type: {clientEnvelope.Type}"
-                });
+                }, context.RequestAborted);
                 break;
         }
     }
 });
 
-app.Run();
+await app.RunAsync();
 
-static async Task<string> ReadMessageAsync(WebSocket socket, byte[] buffer, WebSocketReceiveResult initialResult, CancellationToken cancellationToken)
+static async Task<string?> ReceiveMessageAsync(WebSocket socket, byte[] buffer, CancellationToken cancellationToken)
 {
     using var stream = new MemoryStream();
-    stream.Write(buffer, 0, initialResult.Count);
-
-    var result = initialResult;
-    while (!result.EndOfMessage)
+    while (true)
     {
-        result = await socket.ReceiveAsync(buffer, cancellationToken);
+        var result = await socket.ReceiveAsync(buffer, cancellationToken);
+        if (result.MessageType == WebSocketMessageType.Close)
+        {
+            if (socket.State == WebSocketState.Open)
+            {
+                await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", cancellationToken);
+            }
+
+            return null;
+        }
+
         stream.Write(buffer, 0, result.Count);
+        if (result.EndOfMessage)
+        {
+            return Encoding.UTF8.GetString(stream.ToArray());
+        }
     }
-
-    return Encoding.UTF8.GetString(stream.ToArray());
 }
 
-static async Task SendAsync(WebSocket socket, ServerEnvelope envelope)
+static async Task SendAsync(WebSocket socket, ServerEnvelope envelope, CancellationToken cancellationToken)
 {
-    var json = JsonSerializer.Serialize(envelope, JsonOptions.Default);
-    var bytes = Encoding.UTF8.GetBytes(json);
-    await socket.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
-}
-
-sealed class TranscriptionSessionStore
-{
-    private readonly ConcurrentDictionary<string, TranscriptionSessionSnapshot> sessions = new(StringComparer.OrdinalIgnoreCase);
-
-    public IReadOnlyCollection<TranscriptionSessionSnapshot> GetAll() => sessions.Values.OrderBy(x => x.SessionId, StringComparer.OrdinalIgnoreCase).ToArray();
-
-    public TranscriptionSessionSnapshot StartOrUpdate(string sessionId, string? encoding, int? sampleRate, int? channels, long receivedBytes)
-    {
-        return sessions.AddOrUpdate(
-            sessionId,
-            _ => new TranscriptionSessionSnapshot
-            {
-                SessionId = sessionId,
-                ConnectedAtUtc = DateTimeOffset.UtcNow,
-                UpdatedAtUtc = DateTimeOffset.UtcNow,
-                ReceivedChunkCount = receivedBytes > 0 ? 1 : 0,
-                ReceivedAudioBytes = receivedBytes,
-                LastEncoding = encoding ?? string.Empty,
-                LastSampleRate = sampleRate,
-                LastChannels = channels
-            },
-            (_, existing) =>
-            {
-                existing.UpdatedAtUtc = DateTimeOffset.UtcNow;
-                existing.LastEncoding = encoding ?? existing.LastEncoding;
-                existing.LastSampleRate = sampleRate ?? existing.LastSampleRate;
-                existing.LastChannels = channels ?? existing.LastChannels;
-                if (receivedBytes > 0)
-                {
-                    existing.ReceivedChunkCount += 1;
-                    existing.ReceivedAudioBytes += receivedBytes;
-                }
-
-                return existing;
-            });
-    }
+    var bytes = JsonSerializer.SerializeToUtf8Bytes(envelope, JsonOptions.Default);
+    await socket.SendAsync(bytes, WebSocketMessageType.Text, true, cancellationToken);
 }
 
 static class JsonOptions

@@ -22,13 +22,15 @@ That makes it reusable across:
 
 ## Current implementation
 
-This repo now contains the first working server scaffold:
+This repo now contains a real v2 server path:
 
 - ASP.NET Core service targeting `.NET 10`
 - WebSocket endpoint for incoming audio sessions
-- health endpoint
-- in-memory session tracking
-- honest simulation path for transcript events while real STT is still pending
+- session registry
+- audio windowing
+- whisper.cpp transcription through `Whisper.net`
+- transcript event emission
+- simulation path for downstream testing
 
 ## Architecture
 
@@ -53,9 +55,9 @@ flowchart LR
 {
   "type": "start-session",
   "sessionId": "demo-1",
-  "encoding": "pcm_s16le",
-  "sampleRate": 16000,
-  "channels": 1
+  "encoding": "f32le",
+  "sampleRate": 48000,
+  "channels": 2
 }
 ```
 
@@ -64,7 +66,10 @@ flowchart LR
   "type": "audio-chunk",
   "sessionId": "demo-1",
   "sequence": 1,
-  "audioBase64": "..."
+  "audioBase64": "...",
+  "encoding": "f32le",
+  "sampleRate": 48000,
+  "channels": 2
 }
 ```
 
@@ -83,9 +88,9 @@ flowchart LR
 {
   "type": "transcript",
   "sessionId": "demo-1",
-  "message": "Simulated transcript event.",
+  "message": "Transcript updated.",
   "transcriptText": "Can you explain the tradeoff here?",
-  "isFinal": true
+  "isFinal": false
 }
 ```
 
@@ -99,11 +104,11 @@ src/
 
 ## Design notes
 
-- STT engine wiring is not faked here.
-- The current scaffold is explicit about what is implemented now.
-- `simulate-text` exists only to exercise downstream consumers before real transcription is plugged in.
+- Real STT wiring is present in source.
+- The current implementation transcribes when the pending audio window reaches the configured threshold.
+- `simulate-text` remains available to exercise clients before real machine deployment.
 
 ## Status
 
-Transport scaffold created.
-Real STT integration is the next step.
+Server v2 flow is implemented in source.
+Local build verification is still blocked on this machine because `dotnet` is not installed here.

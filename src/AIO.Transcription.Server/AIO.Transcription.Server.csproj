@@ -5,4 +5,8 @@
   <ItemGroup>
     <ProjectReference Include="..\AIO.Transcription.Server.Contracts\AIO.Transcription.Server.Contracts.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Whisper.net" Version="1.9.1" />
+    <PackageReference Include="Whisper.net.Runtime" Version="1.9.1" />
+  </ItemGroup>
 </Project>
