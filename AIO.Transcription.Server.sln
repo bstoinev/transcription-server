@@ -1,0 +1,34 @@
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{4B50A554-7B3A-48DF-A070-D819A2237858}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AIO.Transcription.Server.Contracts", "src\AIO.Transcription.Server.Contracts\AIO.Transcription.Server.Contracts.csproj", "{5E0AA60A-E92C-426A-B3DF-A68E0922AF4D}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AIO.Transcription.Server", "src\AIO.Transcription.Server\AIO.Transcription.Server.csproj", "{3945C1F8-16AA-42B2-8D16-07F70D283D5C}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{5E0AA60A-E92C-426A-B3DF-A68E0922AF4D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5E0AA60A-E92C-426A-B3DF-A68E0922AF4D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5E0AA60A-E92C-426A-B3DF-A68E0922AF4D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5E0AA60A-E92C-426A-B3DF-A68E0922AF4D}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3945C1F8-16AA-42B2-8D16-07F70D283D5C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3945C1F8-16AA-42B2-8D16-07F70D283D5C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3945C1F8-16AA-42B2-8D16-07F70D283D5C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3945C1F8-16AA-42B2-8D16-07F70D283D5C}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{5E0AA60A-E92C-426A-B3DF-A68E0922AF4D} = {4B50A554-7B3A-48DF-A070-D819A2237858}
+		{3945C1F8-16AA-42B2-8D16-07F70D283D5C} = {4B50A554-7B3A-48DF-A070-D819A2237858}
+	EndGlobalSection
+EndGlobal

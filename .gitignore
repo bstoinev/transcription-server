@@ -1,0 +1,34 @@
+# Build results
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+[Ll]og/
+[Ll]ogs/
+[Aa]rtifacts/
+[Tt]est[Rr]esults/
+
+# Visual Studio / Rider / VS Code
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# NuGet
+*.nupkg
+packages/
+.nuget/
+
+# Publish / coverage
+publish/
+coverage/
+coverage-results/
+*.coverage
+*.coveragexml
+
+# OS
+.DS_Store
+Thumbs.db
