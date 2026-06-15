@@ -46,7 +46,7 @@ public sealed class SessionRegistry
         lock (sync)
         {
             log.Trace($"Enumerating active sessions. ActiveSessionCount={sessions.Count}");
-            return sessions.Values.Select(x => x.Snapshot).OrderBy(x => x.SessionId, StringComparer.OrdinalIgnoreCase).ToArray();
+            return sessions.Values.Select(x => x.CreateSnapshot()).OrderBy(x => x.SessionId, StringComparer.OrdinalIgnoreCase).ToArray();
         }
     }
 

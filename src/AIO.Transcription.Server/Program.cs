@@ -9,9 +9,13 @@ using AIO.Transcription.Server.Transcription;
 using LogMachina;
 using LogMachina.DependencyInjection;
 using NLog;
+using NLog.Config;
+using NLog.Targets;
 
 var builder = WebApplication.CreateBuilder(args);
+WriteBootstrapTrace(builder.Environment.ContentRootPath, "Process entered Main.");
 ConfigureNLog(builder.Environment);
+WriteBootstrapTrace(builder.Environment.ContentRootPath, "NLog configuration completed.");
 
 var whisperOptions = new WhisperTranscriberOptions();
 builder.Configuration.GetSection("Transcription").Bind(whisperOptions);
@@ -118,6 +122,7 @@ app.Map("/ws/transcribe", async context =>
                     }
 
                     var started = registry.GetOrCreate(clientEnvelope.SessionId);
+                    var startedSnapshot = started.CreateSnapshot();
                     logger.Info(
                         $"Session started. SessionId={started.SessionId} Encoding={clientEnvelope.Encoding ?? "<null>"} SampleRate={clientEnvelope.SampleRate?.ToString() ?? "<null>"} Channels={clientEnvelope.Channels?.ToString() ?? "<null>"}");
                     await SendAsync(socket, new ServerEnvelope
@@ -125,8 +130,8 @@ app.Map("/ws/transcribe", async context =>
                         Type = "session-started",
                         SessionId = started.SessionId,
                         Message = "Session registered.",
-                        ReceivedChunkCount = started.Snapshot.ReceivedChunkCount,
-                        ReceivedAudioBytes = started.Snapshot.ReceivedAudioBytes,
+                        ReceivedChunkCount = startedSnapshot.ReceivedChunkCount,
+                        ReceivedAudioBytes = startedSnapshot.ReceivedAudioBytes,
                     }, context.RequestAborted);
                     break;
 
@@ -164,17 +169,18 @@ app.Map("/ws/transcribe", async context =>
                         clientEnvelope.Channels ?? 2,
                         clientEnvelope.Encoding ?? "f32le",
                         DateTimeOffset.UtcNow), context.RequestAborted);
+                    var sessionSnapshot = session.CreateSnapshot();
 
                     await SendAsync(socket, new ServerEnvelope
                     {
                         Type = "audio-ack",
                         SessionId = currentSessionId,
                         Message = "Audio chunk received.",
-                        ReceivedChunkCount = session.Snapshot.ReceivedChunkCount,
-                        ReceivedAudioBytes = session.Snapshot.ReceivedAudioBytes,
+                        ReceivedChunkCount = sessionSnapshot.ReceivedChunkCount,
+                        ReceivedAudioBytes = sessionSnapshot.ReceivedAudioBytes,
                     }, context.RequestAborted);
                     logger.Trace(
-                        $"Sent audio ack. SessionId={currentSessionId} Sequence={clientEnvelope.Sequence} ReceivedChunkCount={session.Snapshot.ReceivedChunkCount} ReceivedAudioBytes={session.Snapshot.ReceivedAudioBytes}");
+                        $"Sent audio ack. SessionId={currentSessionId} Sequence={clientEnvelope.Sequence} ReceivedChunkCount={sessionSnapshot.ReceivedChunkCount} ReceivedAudioBytes={sessionSnapshot.ReceivedAudioBytes}");
 
                     if (update is not null)
                     {
@@ -211,8 +217,9 @@ app.Map("/ws/transcribe", async context =>
                     }
 
                     var removed = registry.Remove(currentSessionId);
+                    var removedSnapshot = removed?.CreateSnapshot();
                     logger.Info(
-                        $"Session ended by client. SessionId={currentSessionId} Removed={removed is not null} ReceivedChunkCount={removed?.Snapshot.ReceivedChunkCount ?? 0} ReceivedAudioBytes={removed?.Snapshot.ReceivedAudioBytes ?? 0}");
+                        $"Session ended by client. SessionId={currentSessionId} Removed={removed is not null} ReceivedChunkCount={removedSnapshot?.ReceivedChunkCount ?? 0} ReceivedAudioBytes={removedSnapshot?.ReceivedAudioBytes ?? 0}");
                     await SendAsync(socket,
                         removed?.BuildEndedEnvelope() ?? new ServerEnvelope { Type = "session-ended", SessionId = currentSessionId, Message = "Session ended." },
                         context.RequestAborted);
@@ -259,7 +266,10 @@ app.Map("/ws/transcribe", async context =>
 
     if (!string.IsNullOrWhiteSpace(currentSessionId))
     {
-        logger.Warn($"WebSocket handler exited with an active session still registered. SessionId={currentSessionId}");
+        var removed = registry.Remove(currentSessionId);
+        var removedSnapshot = removed?.CreateSnapshot();
+        logger.Warn(
+            $"WebSocket handler exited with an active session. SessionId={currentSessionId} Removed={removed is not null} ReceivedChunkCount={removedSnapshot?.ReceivedChunkCount ?? 0} ReceivedAudioBytes={removedSnapshot?.ReceivedAudioBytes ?? 0}");
     }
 
     logger.Info($"WebSocket handler completed. FinalSocketState={socket.State} FinalSessionId={currentSessionId}");
@@ -299,11 +309,90 @@ static async Task SendAsync(WebSocket socket, ServerEnvelope envelope, Cancellat
 
 static void ConfigureNLog(IHostEnvironment environment)
 {
-    GlobalDiagnosticsContext.Set("LogRoot", environment.ContentRootPath);
-    var contentRootConfigPath = Path.Combine(environment.ContentRootPath, "NLog.config");
-    var baseDirectoryConfigPath = Path.Combine(AppContext.BaseDirectory, "NLog.config");
-    var configPath = File.Exists(contentRootConfigPath) ? contentRootConfigPath : baseDirectoryConfigPath;
-    LogManager.Setup().LoadConfigurationFromFile(configPath);
+    try
+    {
+        GlobalDiagnosticsContext.Set("LogRoot", environment.ContentRootPath);
+        var contentRootConfigPath = Path.Combine(environment.ContentRootPath, "NLog.config");
+        var baseDirectoryConfigPath = Path.Combine(AppContext.BaseDirectory, "NLog.config");
+        WriteBootstrapTrace(
+            environment.ContentRootPath,
+            $"ConfigureNLog: ContentRoot={environment.ContentRootPath} BaseDirectory={AppContext.BaseDirectory} ContentRootConfigExists={File.Exists(contentRootConfigPath)} BaseDirectoryConfigExists={File.Exists(baseDirectoryConfigPath)}");
+        if (File.Exists(contentRootConfigPath))
+        {
+            LogManager.Setup().LoadConfigurationFromFile(contentRootConfigPath);
+            return;
+        }
+
+        if (File.Exists(baseDirectoryConfigPath))
+        {
+            LogManager.Setup().LoadConfigurationFromFile(baseDirectoryConfigPath);
+            return;
+        }
+
+        LogManager.Configuration = BuildFallbackLoggingConfiguration(environment.ContentRootPath);
+    }
+    catch (Exception ex)
+    {
+        WriteBootstrapTrace(environment.ContentRootPath, $"ConfigureNLog failed: {ex}");
+        throw;
+    }
+}
+
+static LoggingConfiguration BuildFallbackLoggingConfiguration(string logRoot)
+{
+    var layout = "${longdate}|${uppercase:${level}}|${logger}|${message}${onexception:inner=|${exception:format=ToString}}";
+    var config = new LoggingConfiguration();
+
+    var consoleTarget = new ConsoleTarget("console")
+    {
+        Layout = layout
+    };
+
+    var fileTarget = new FileTarget("file")
+    {
+        FileName = Path.Combine(logRoot, "transcription-server.log"),
+        KeepFileOpen = false,
+        CreateDirs = true,
+        Layout = layout
+    };
+
+    var errorTarget = new FileTarget("errors")
+    {
+        FileName = Path.Combine(logRoot, "transcription-server.errors.log"),
+        KeepFileOpen = false,
+        CreateDirs = true,
+        Layout = layout
+    };
+
+    config.AddTarget(consoleTarget);
+    config.AddTarget(fileTarget);
+    config.AddTarget(errorTarget);
+
+    config.AddRuleForAllLevels(fileTarget);
+    config.AddRule(NLog.LogLevel.Info, NLog.LogLevel.Fatal, consoleTarget);
+    config.AddRule(NLog.LogLevel.Error, NLog.LogLevel.Fatal, errorTarget);
+    return config;
+}
+
+static void WriteBootstrapTrace(string contentRootPath, string message)
+{
+    try
+    {
+        var lines = $"{DateTimeOffset.UtcNow:O}|PID={Environment.ProcessId}|{message}{Environment.NewLine}";
+        File.AppendAllText(Path.Combine(contentRootPath, "bootstrap.log"), lines);
+    }
+    catch
+    {
+    }
+
+    try
+    {
+        var lines = $"{DateTimeOffset.UtcNow:O}|PID={Environment.ProcessId}|{message}{Environment.NewLine}";
+        File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "bootstrap.log"), lines);
+    }
+    catch
+    {
+    }
 }
 
 static class JsonOptions

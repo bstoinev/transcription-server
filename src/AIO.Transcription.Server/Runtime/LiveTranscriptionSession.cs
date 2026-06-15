@@ -13,6 +13,7 @@ public sealed class LiveTranscriptionSession
     private readonly IWaveTranscriber transcriber;
     private readonly WhisperTranscriberOptions options;
     private readonly ILogMachina<LiveTranscriptionSession> log;
+    private readonly TranscriptionSessionSnapshot snapshot;
     private string lastTranscriptSegment = string.Empty;
 
     public LiveTranscriptionSession(string sessionId, IWaveTranscriber transcriber, WhisperTranscriberOptions options, ILogMachina<LiveTranscriptionSession> log)
@@ -21,7 +22,7 @@ public sealed class LiveTranscriptionSession
         this.transcriber = transcriber;
         this.options = options;
         this.log = log;
-        Snapshot = new TranscriptionSessionSnapshot
+        snapshot = new TranscriptionSessionSnapshot
         {
             SessionId = sessionId,
             ConnectedAtUtc = DateTimeOffset.UtcNow,
@@ -32,33 +33,32 @@ public sealed class LiveTranscriptionSession
 
     public string SessionId { get; }
 
-    public TranscriptionSessionSnapshot Snapshot { get; }
-
     public async Task<ServerEnvelope?> AddAudioChunkAsync(AudioChunk chunk, CancellationToken cancellationToken)
     {
         List<AudioChunk>? window = null;
+        TranscriptionSessionSnapshot? snapshotCopy = null;
         lock (sync)
         {
-            if (Snapshot.ReceivedChunkCount > 0 &&
-                (!string.Equals(Snapshot.LastEncoding, chunk.Encoding, StringComparison.OrdinalIgnoreCase) ||
-                 Snapshot.LastSampleRate != chunk.SampleRate ||
-                 Snapshot.LastChannels != chunk.Channels))
+            if (snapshot.ReceivedChunkCount > 0 &&
+                (!string.Equals(snapshot.LastEncoding, chunk.Encoding, StringComparison.OrdinalIgnoreCase) ||
+                 snapshot.LastSampleRate != chunk.SampleRate ||
+                 snapshot.LastChannels != chunk.Channels))
             {
                 log.Warn(
-                    $"Audio format changed within active session. SessionId={SessionId} PreviousEncoding={Snapshot.LastEncoding} PreviousSampleRate={Snapshot.LastSampleRate} PreviousChannels={Snapshot.LastChannels} NewEncoding={chunk.Encoding} NewSampleRate={chunk.SampleRate} NewChannels={chunk.Channels}");
+                    $"Audio format changed within active session. SessionId={SessionId} PreviousEncoding={snapshot.LastEncoding} PreviousSampleRate={snapshot.LastSampleRate} PreviousChannels={snapshot.LastChannels} NewEncoding={chunk.Encoding} NewSampleRate={chunk.SampleRate} NewChannels={chunk.Channels}");
             }
 
             pendingChunks.Add(chunk);
-            Snapshot.UpdatedAtUtc = DateTimeOffset.UtcNow;
-            Snapshot.ReceivedChunkCount += 1;
-            Snapshot.ReceivedAudioBytes += chunk.BytesRecorded;
-            Snapshot.LastEncoding = chunk.Encoding;
-            Snapshot.LastSampleRate = chunk.SampleRate;
-            Snapshot.LastChannels = chunk.Channels;
+            snapshot.UpdatedAtUtc = DateTimeOffset.UtcNow;
+            snapshot.ReceivedChunkCount += 1;
+            snapshot.ReceivedAudioBytes += chunk.BytesRecorded;
+            snapshot.LastEncoding = chunk.Encoding;
+            snapshot.LastSampleRate = chunk.SampleRate;
+            snapshot.LastChannels = chunk.Channels;
 
             var pendingMs = pendingChunks.Sum(WavePcm16Writer.EstimateChunkMilliseconds);
             log.Trace(
-                $"Buffered audio chunk. SessionId={SessionId} ChunkBytes={chunk.BytesRecorded} PendingChunkCount={pendingChunks.Count} PendingMilliseconds={pendingMs:F2} ReceivedChunkCount={Snapshot.ReceivedChunkCount}");
+                $"Buffered audio chunk. SessionId={SessionId} ChunkBytes={chunk.BytesRecorded} PendingChunkCount={pendingChunks.Count} PendingMilliseconds={pendingMs:F2} ReceivedChunkCount={snapshot.ReceivedChunkCount}");
             if (pendingMs >= options.MinimumWindowMilliseconds)
             {
                 window = [.. pendingChunks];
@@ -66,6 +66,8 @@ public sealed class LiveTranscriptionSession
                 log.Info(
                     $"Transcription window reached. SessionId={SessionId} WindowChunkCount={window.Count} PendingMilliseconds={pendingMs:F2} TargetSampleRate={options.TargetSampleRate}");
             }
+
+            snapshotCopy = CloneSnapshot(snapshot);
         }
 
         if (window is null)
@@ -102,20 +104,44 @@ public sealed class LiveTranscriptionSession
             Message = "Transcript updated.",
             TranscriptText = text,
             IsFinal = false,
-            ReceivedChunkCount = Snapshot.ReceivedChunkCount,
-            ReceivedAudioBytes = Snapshot.ReceivedAudioBytes,
+            ReceivedChunkCount = snapshotCopy?.ReceivedChunkCount,
+            ReceivedAudioBytes = snapshotCopy?.ReceivedAudioBytes,
         };
     }
 
     public ServerEnvelope BuildEndedEnvelope()
     {
+        var snapshotCopy = CreateSnapshot();
         return new ServerEnvelope
         {
             Type = "session-ended",
             SessionId = SessionId,
             Message = "Session ended.",
-            ReceivedChunkCount = Snapshot.ReceivedChunkCount,
-            ReceivedAudioBytes = Snapshot.ReceivedAudioBytes,
+            ReceivedChunkCount = snapshotCopy.ReceivedChunkCount,
+            ReceivedAudioBytes = snapshotCopy.ReceivedAudioBytes,
+        };
+    }
+
+    public TranscriptionSessionSnapshot CreateSnapshot()
+    {
+        lock (sync)
+        {
+            return CloneSnapshot(snapshot);
+        }
+    }
+
+    private static TranscriptionSessionSnapshot CloneSnapshot(TranscriptionSessionSnapshot source)
+    {
+        return new TranscriptionSessionSnapshot
+        {
+            SessionId = source.SessionId,
+            ConnectedAtUtc = source.ConnectedAtUtc,
+            UpdatedAtUtc = source.UpdatedAtUtc,
+            ReceivedChunkCount = source.ReceivedChunkCount,
+            ReceivedAudioBytes = source.ReceivedAudioBytes,
+            LastEncoding = source.LastEncoding,
+            LastSampleRate = source.LastSampleRate,
+            LastChannels = source.LastChannels,
         };
     }
 }
