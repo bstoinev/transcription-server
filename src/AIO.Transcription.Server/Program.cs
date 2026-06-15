@@ -1,6 +1,7 @@
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using AIO.Transcription.Server;
 using AIO.Transcription.Server.Audio;
 using AIO.Transcription.Server.Contracts.Protocol;
 using AIO.Transcription.Server.Runtime;
@@ -18,12 +19,21 @@ builder.Logging.AddSimpleConsole(options =>
 var whisperOptions = new WhisperTranscriberOptions();
 builder.Configuration.GetSection("Transcription").Bind(whisperOptions);
 
+var hostingOptions = new HostingOptions();
+builder.Configuration.GetSection(HostingOptions.SectionName).Bind(hostingOptions);
+
+if (!string.IsNullOrWhiteSpace(hostingOptions.Urls))
+{
+    builder.WebHost.UseUrls(hostingOptions.Urls);
+}
+
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
     options.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
     options.SerializerOptions.WriteIndented = true;
 });
 builder.Services.AddSingleton(whisperOptions);
+builder.Services.AddSingleton(hostingOptions);
 builder.Services.AddSingleton<IWaveTranscriber, WhisperCppTranscriber>();
 builder.Services.AddSingleton<SessionRegistry>();
 
@@ -31,11 +41,12 @@ var app = builder.Build();
 app.UseWebSockets();
 
 app.MapGet("/", () => Results.Redirect("/healthz"));
-app.MapGet("/healthz", (WhisperTranscriberOptions options) => Results.Ok(new
+app.MapGet("/healthz", (WhisperTranscriberOptions options, HostingOptions hosting) => Results.Ok(new
 {
     service = "AIO.Transcription.Server",
     status = "ok",
     timeUtc = DateTimeOffset.UtcNow,
+    urls = hosting.Urls,
     minimumWindowMilliseconds = options.MinimumWindowMilliseconds,
     boundaryDetectionEnabled = options.BoundaryDetectionEnabled,
     boundaryDetectionRmsThreshold = options.BoundaryDetectionRmsThreshold,

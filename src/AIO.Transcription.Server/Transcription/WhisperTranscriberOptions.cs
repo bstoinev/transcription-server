@@ -4,7 +4,7 @@ public sealed class WhisperTranscriberOptions
 {
     public string? ModelPath { get; set; }
     public bool AutoDownloadModel { get; set; } = true;
-    public string ModelType { get; set; } = "TinyEn";
+    public string ModelType { get; set; } = "Tiny";
     public int TargetSampleRate { get; set; } = 16000;
     public int MinimumWindowMilliseconds { get; set; } = 3500;
     public bool BoundaryDetectionEnabled { get; set; } = true;

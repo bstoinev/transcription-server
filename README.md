@@ -47,6 +47,67 @@ flowchart LR
 - `GET /sessions`
 - `WS /ws/transcribe`
 
+`/healthz` also reports the configured `urls` value so you can confirm which binding the server was started with.
+
+## Host binding / port configuration
+
+Default self-host binding:
+
+```json
+{
+  "Hosting": {
+    "urls": "http://127.0.0.1:43071"
+  }
+}
+```
+
+You can override it in any normal ASP.NET Core way, for example:
+
+- `appsettings.json`
+- environment variable: `Hosting__Urls=http://0.0.0.0:43071`
+- command line: `--Hosting:Urls=http://127.0.0.1:43100`
+
+Examples:
+
+```bash
+dotnet run --project src/AIO.Transcription.Server -- --Hosting:Urls=http://127.0.0.1:43100
+```
+
+```powershell
+$env:Hosting__Urls = "http://0.0.0.0:43071"
+dotnet AIO.Transcription.Server.dll
+```
+
+## Windows IIS hosting
+
+If the target Windows machine already has IIS, this server can be hosted as a normal ASP.NET Core IIS site.
+
+Recommended shape:
+
+1. Install the matching **ASP.NET Core Hosting Bundle** on the Windows machine.
+2. Publish the server.
+3. Create an IIS site pointing at the publish folder.
+4. Use the generated `web.config` and let ASP.NET Core Module launch the app.
+
+Example publish command:
+
+```bash
+dotnet publish src/AIO.Transcription.Server/AIO.Transcription.Server.csproj -c Release -r win-x64 --self-contained false -o publish/win-x64
+```
+
+Notes:
+
+- In IIS mode, IIS owns the public binding/port.
+- The app still keeps the same paths:
+  - `/healthz`
+  - `/sessions`
+  - `/ws/transcribe`
+- The desktop client should then use the IIS site base URL instead of a localhost Kestrel port if you expose it that way.
+
+## Linux service hosting
+
+If you want classic Linux self-hosting, use a supervisor such as `systemd` and point it at the published app. In that mode `Hosting:Urls` controls the bind address/port.
+
 ## Protocol shape
 
 ### Client → server

@@ -19,5 +19,11 @@
   <ItemGroup>
     <ProjectReference Include="../../src/AIO.Transcription.Server/AIO.Transcription.Server.csproj" />
     <ProjectReference Include="../../src/AIO.Transcription.Server.Contracts/AIO.Transcription.Server.Contracts.csproj" />
+    <ProjectReference Include="../../../interview-assistant/src/InterviewAssistant.Core/InterviewAssistant.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="TestData/**/*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 </Project>
