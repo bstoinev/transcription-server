@@ -37,6 +37,11 @@ app.MapGet("/healthz", (WhisperTranscriberOptions options) => Results.Ok(new
     status = "ok",
     timeUtc = DateTimeOffset.UtcNow,
     minimumWindowMilliseconds = options.MinimumWindowMilliseconds,
+    boundaryDetectionEnabled = options.BoundaryDetectionEnabled,
+    boundaryDetectionRmsThreshold = options.BoundaryDetectionRmsThreshold,
+    boundarySilenceMilliseconds = options.BoundarySilenceMilliseconds,
+    minimumSpeechMilliseconds = options.MinimumSpeechMilliseconds,
+    maximumSegmentMilliseconds = options.MaximumSegmentMilliseconds,
     modelType = options.ModelType,
     targetSampleRate = options.TargetSampleRate
 }));
@@ -142,13 +147,15 @@ app.Map("/ws/transcribe", async context =>
                 }
 
                 var session = registry.GetOrCreate(currentSessionId);
-                var update = await session.AddAudioChunkAsync(new AudioChunk(
+                var updates = await session.AddAudioChunkAsync(new AudioChunk(
                     audioBytes,
                     audioBytes.Length,
                     clientEnvelope.SampleRate ?? 48000,
                     clientEnvelope.Channels ?? 2,
                     clientEnvelope.Encoding ?? "f32le",
-                    DateTimeOffset.UtcNow), context.RequestAborted);
+                    DateTimeOffset.UtcNow),
+                    clientEnvelope.IsFinalChunk ?? false,
+                    context.RequestAborted);
 
                 await SendAsync(socket, new ServerEnvelope
                 {
@@ -159,7 +166,7 @@ app.Map("/ws/transcribe", async context =>
                     ReceivedAudioBytes = session.Snapshot.ReceivedAudioBytes,
                 }, context.RequestAborted);
 
-                if (update is not null)
+                foreach (var update in updates)
                 {
                     await SendAsync(socket, update, context.RequestAborted);
                 }
@@ -191,6 +198,15 @@ app.Map("/ws/transcribe", async context =>
                 }
 
                 var removed = registry.Remove(currentSessionId);
+                if (removed is not null)
+                {
+                    var finalUpdates = await removed.CompleteAsync(context.RequestAborted);
+                    foreach (var finalUpdate in finalUpdates)
+                    {
+                        await SendAsync(socket, finalUpdate, context.RequestAborted);
+                    }
+                }
+
                 await SendAsync(socket,
                     removed?.BuildEndedEnvelope() ?? new ServerEnvelope { Type = "session-ended", SessionId = currentSessionId, Message = "Session ended." },
                     context.RequestAborted);

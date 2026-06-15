@@ -40,13 +40,37 @@ public static class WavePcm16Writer
         return frames * 1000.0 / Math.Max(1, chunk.SampleRate);
     }
 
+    public static double EstimateRootMeanSquare(AudioChunk chunk)
+    {
+        var sampleCount = 0;
+        var squareSum = 0.0;
+        foreach (var sample in ReadMonoSamples(chunk))
+        {
+            squareSum += sample * sample;
+            sampleCount += 1;
+        }
+
+        if (sampleCount == 0)
+        {
+            return 0.0;
+        }
+
+        return Math.Sqrt(squareSum / sampleCount);
+    }
+
+    public static bool HasSpeech(AudioChunk chunk, double rmsThreshold)
+    {
+        return EstimateRootMeanSquare(chunk) >= Math.Max(0.0, rmsThreshold);
+    }
+
     private static IEnumerable<float> ReadMonoSamples(AudioChunk chunk)
     {
         var channels = Math.Max(1, chunk.Channels);
         if (chunk.Encoding.Equals("f32le", StringComparison.OrdinalIgnoreCase))
         {
             var bytesPerFrameFloat = channels * sizeof(float);
-            for (var offset = 0; offset < chunk.BytesRecorded; offset += bytesPerFrameFloat)
+            var usableBytes = chunk.BytesRecorded - (chunk.BytesRecorded % bytesPerFrameFloat);
+            for (var offset = 0; offset < usableBytes; offset += bytesPerFrameFloat)
             {
                 var sum = 0.0f;
                 for (var channel = 0; channel < channels; channel += 1)
@@ -63,7 +87,8 @@ public static class WavePcm16Writer
         if (chunk.Encoding.Equals("pcm_s16le", StringComparison.OrdinalIgnoreCase))
         {
             var bytesPerFramePcm16 = channels * sizeof(short);
-            for (var offset = 0; offset < chunk.BytesRecorded; offset += bytesPerFramePcm16)
+            var usableBytes = chunk.BytesRecorded - (chunk.BytesRecorded % bytesPerFramePcm16);
+            for (var offset = 0; offset < usableBytes; offset += bytesPerFramePcm16)
             {
                 var sum = 0.0f;
                 for (var channel = 0; channel < channels; channel += 1)
