@@ -6,7 +6,15 @@
     <ProjectReference Include="..\AIO.Transcription.Server.Contracts\AIO.Transcription.Server.Contracts.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <PackageReference Include="LogMachina.DependencyInjection" Version="1.1.0" />
+    <PackageReference Include="LogMachina.NLog" Version="1.1.0" />
+    <PackageReference Include="NLog" Version="6.1.1" />
     <PackageReference Include="Whisper.net" Version="1.9.1" />
     <PackageReference Include="Whisper.net.Runtime" Version="1.9.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="NLog.config">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 </Project>

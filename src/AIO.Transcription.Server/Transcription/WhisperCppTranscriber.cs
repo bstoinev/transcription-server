@@ -1,4 +1,6 @@
 using System.Text;
+using AIO.Transcription.Server.Logging;
+using LogMachina;
 using Whisper.net;
 using Whisper.net.Ggml;
 
@@ -7,15 +9,15 @@ namespace AIO.Transcription.Server.Transcription;
 public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
 {
     private readonly WhisperTranscriberOptions options;
-    private readonly ILogger<WhisperCppTranscriber> logger;
+    private readonly ILogMachina<WhisperCppTranscriber> log;
     private readonly SemaphoreSlim modelLock = new(1, 1);
     private WhisperFactory? factory;
     private string? resolvedModelPath;
 
-    public WhisperCppTranscriber(WhisperTranscriberOptions options, ILogger<WhisperCppTranscriber> logger)
+    public WhisperCppTranscriber(WhisperTranscriberOptions options, ILogMachina<WhisperCppTranscriber> log)
     {
         this.options = options;
-        this.logger = logger;
+        this.log = log;
     }
 
     public async Task<string> TranscribeWaveAsync(byte[] waveBytes, CancellationToken cancellationToken)
@@ -29,6 +31,7 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         await modelLock.WaitAsync(cancellationToken);
         try
         {
+            log.Debug($"Starting whisper transcription. WaveBytes={waveBytes.Length}");
             var modelPath = await EnsureModelPathAsync(cancellationToken);
             factory ??= WhisperFactory.FromPath(modelPath);
             await using var processor = factory.CreateBuilder().WithLanguage("auto").Build();
@@ -50,7 +53,9 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
                 transcript.Append(text);
             }
 
-            return transcript.ToString().Trim();
+            var result = transcript.ToString().Trim();
+            log.Info($"Completed whisper transcription. WaveBytes={waveBytes.Length} TranscriptChars={result.Length}");
+            return result;
         }
         finally
         {
@@ -60,6 +65,7 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
 
     public void Dispose()
     {
+        log.Info("Disposing whisper transcriber resources.");
         factory?.Dispose();
         modelLock.Dispose();
     }
@@ -68,6 +74,7 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
     {
         if (!string.IsNullOrWhiteSpace(resolvedModelPath) && File.Exists(resolvedModelPath))
         {
+            log.Trace($"Using cached whisper model path. ModelPath={resolvedModelPath}");
             return resolvedModelPath;
         }
 
@@ -79,6 +86,7 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
             }
 
             resolvedModelPath = options.ModelPath;
+            log.Info($"Using configured whisper model path. ModelPath={resolvedModelPath}");
             return resolvedModelPath;
         }
 
@@ -96,7 +104,7 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         var targetPath = Path.Combine(modelDirectory, $"ggml-{extension}.bin");
         if (!File.Exists(targetPath))
         {
-            logger.LogInformation("Downloading whisper.cpp model {ModelType} to {TargetPath}", ggmlType, targetPath);
+            log.Info($"Downloading whisper model. ModelType={ggmlType} TargetPath={targetPath}");
             await using var modelStream = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(
                 ggmlType,
                 QuantizationType.NoQuantization,
@@ -106,6 +114,7 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         }
 
         resolvedModelPath = targetPath;
+        log.Info($"Resolved whisper model path. ModelPath={resolvedModelPath}");
         return resolvedModelPath;
     }
 }

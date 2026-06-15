@@ -5,6 +5,9 @@ namespace AIO.Transcription.Server.Audio;
 
 public static class WavePcm16Writer
 {
+    private const string Float32Le = "f32le";
+    private const string Pcm16Le = "pcm_s16le";
+
     public static byte[] WriteWaveFile(IReadOnlyList<AudioChunk> chunks, int targetSampleRate)
     {
         ArgumentNullException.ThrowIfNull(chunks);
@@ -35,7 +38,8 @@ public static class WavePcm16Writer
     public static double EstimateChunkMilliseconds(AudioChunk chunk)
     {
         var channels = Math.Max(1, chunk.Channels);
-        var bytesPerSample = chunk.Encoding.Equals("f32le", StringComparison.OrdinalIgnoreCase) ? sizeof(float) : sizeof(short);
+        var encoding = NormalizeEncoding(chunk.Encoding);
+        var bytesPerSample = encoding == Float32Le ? sizeof(float) : sizeof(short);
         var frames = chunk.BytesRecorded / Math.Max(1, channels * bytesPerSample);
         return frames * 1000.0 / Math.Max(1, chunk.SampleRate);
     }
@@ -43,9 +47,11 @@ public static class WavePcm16Writer
     private static IEnumerable<float> ReadMonoSamples(AudioChunk chunk)
     {
         var channels = Math.Max(1, chunk.Channels);
-        if (chunk.Encoding.Equals("f32le", StringComparison.OrdinalIgnoreCase))
+        var encoding = NormalizeEncoding(chunk.Encoding);
+        if (encoding == Float32Le)
         {
             var bytesPerFrameFloat = channels * sizeof(float);
+            ValidateChunkAlignment(chunk, bytesPerFrameFloat);
             for (var offset = 0; offset < chunk.BytesRecorded; offset += bytesPerFrameFloat)
             {
                 var sum = 0.0f;
@@ -60,9 +66,10 @@ public static class WavePcm16Writer
             yield break;
         }
 
-        if (chunk.Encoding.Equals("pcm_s16le", StringComparison.OrdinalIgnoreCase))
+        if (encoding == Pcm16Le)
         {
             var bytesPerFramePcm16 = channels * sizeof(short);
+            ValidateChunkAlignment(chunk, bytesPerFramePcm16);
             for (var offset = 0; offset < chunk.BytesRecorded; offset += bytesPerFramePcm16)
             {
                 var sum = 0.0f;
@@ -78,6 +85,36 @@ public static class WavePcm16Writer
         }
 
         throw new InvalidOperationException($"Unsupported audio encoding: {chunk.Encoding}");
+    }
+
+    private static string NormalizeEncoding(string? encoding)
+    {
+        if (string.IsNullOrWhiteSpace(encoding))
+        {
+            throw new InvalidOperationException("Audio chunk encoding is required.");
+        }
+
+        return encoding.Trim().ToLowerInvariant() switch
+        {
+            "f32le" or "f32" or "float" or "float32" or "float32le" or "ieeefloat" => Float32Le,
+            "pcm_s16le" or "pcm16" or "pcm16le" or "s16le" or "int16" => Pcm16Le,
+            _ => throw new InvalidOperationException($"Unsupported audio encoding: {encoding}")
+        };
+    }
+
+    private static void ValidateChunkAlignment(AudioChunk chunk, int bytesPerFrame)
+    {
+        if (chunk.BytesRecorded < 0 || chunk.BytesRecorded > chunk.Buffer.Length)
+        {
+            throw new InvalidOperationException(
+                $"Audio chunk byte count {chunk.BytesRecorded} is outside the buffer length {chunk.Buffer.Length}.");
+        }
+
+        if (chunk.BytesRecorded % bytesPerFrame != 0)
+        {
+            throw new InvalidOperationException(
+                $"Audio chunk size {chunk.BytesRecorded} is not aligned to frame size {bytesPerFrame} for {chunk.Encoding}.");
+        }
     }
 
     private static float[] Resample(IReadOnlyList<float> source, int sourceRate, int targetRate)
