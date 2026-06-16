@@ -10,7 +10,7 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
 {
     private readonly WhisperTranscriberOptions options;
     private readonly ILogMachina<WhisperCppTranscriber> log;
-    private readonly SemaphoreSlim modelLock = new(1, 1);
+    private readonly SemaphoreSlim initializationLock = new(1, 1);
     private WhisperFactory? factory;
     private string? resolvedModelPath;
 
@@ -28,61 +28,36 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
             return string.Empty;
         }
 
-        await modelLock.WaitAsync(cancellationToken);
-        try
+        var currentFactory = await GetFactoryAsync(cancellationToken);
+        await using var processor = currentFactory.CreateBuilder().WithLanguage("auto").Build();
+        using var stream = new MemoryStream(waveBytes, writable: false);
+        var transcript = new StringBuilder();
+        await foreach (var segment in processor.ProcessAsync(stream, cancellationToken))
         {
-            var modelPath = await EnsureModelPathAsync(cancellationToken);
-            if (factory is null)
+            var text = segment.Text?.Trim();
+            if (string.IsNullOrWhiteSpace(text))
             {
-                var factoryOptions = new WhisperFactoryOptions
-                {
-                    UseGpu = options.UseGpu,
-                    GpuDevice = options.GpuDevice,
-                    UseFlashAttention = options.UseFlashAttention
-                };
-
-                log.Info(
-                    $"Initializing whisper factory. ModelPath={modelPath} UseGpu={factoryOptions.UseGpu} GpuDevice={factoryOptions.GpuDevice} UseFlashAttention={factoryOptions.UseFlashAttention}");
-                factory = WhisperFactory.FromPath(modelPath, factoryOptions);
-                var runtimeInfo = WhisperFactory.GetRuntimeInfo() ?? string.Empty;
-                log.Info($"Whisper runtime info: {runtimeInfo}");
-                EnforceRuntimeExpectation(runtimeInfo);
+                continue;
             }
 
-            await using var processor = factory.CreateBuilder().WithLanguage("auto").Build();
-            using var stream = new MemoryStream(waveBytes, writable: false);
-            var transcript = new StringBuilder();
-            await foreach (var segment in processor.ProcessAsync(stream, cancellationToken))
+            if (transcript.Length > 0)
             {
-                var text = segment.Text?.Trim();
-                if (string.IsNullOrWhiteSpace(text))
-                {
-                    continue;
-                }
-
-                if (transcript.Length > 0)
-                {
-                    transcript.Append(' ');
-                }
-
-                transcript.Append(text);
+                transcript.Append(' ');
             }
 
-            var result = transcript.ToString().Trim();
-            log.Info($"Completed whisper transcription. WaveBytes={waveBytes.Length} TranscriptChars={result.Length}");
-            return result;
+            transcript.Append(text);
         }
-        finally
-        {
-            modelLock.Release();
-        }
+
+        var result = transcript.ToString().Trim();
+        log.Info($"Completed whisper transcription. WaveBytes={waveBytes.Length} TranscriptChars={result.Length}");
+        return result;
     }
 
     public void Dispose()
     {
         log.Info("Disposing whisper transcriber resources.");
         factory?.Dispose();
-        modelLock.Dispose();
+        initializationLock.Dispose();
     }
 
     private async Task<string> EnsureModelPathAsync(CancellationToken cancellationToken)
@@ -130,6 +105,43 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         resolvedModelPath = targetPath;
         log.Info($"Resolved whisper model path. ModelPath={resolvedModelPath}");
         return resolvedModelPath;
+    }
+
+    private async Task<WhisperFactory> GetFactoryAsync(CancellationToken cancellationToken)
+    {
+        if (factory is not null)
+        {
+            return factory;
+        }
+
+        await initializationLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (factory is not null)
+            {
+                return factory;
+            }
+
+            var modelPath = await EnsureModelPathAsync(cancellationToken);
+            var factoryOptions = new WhisperFactoryOptions
+            {
+                UseGpu = options.UseGpu,
+                GpuDevice = options.GpuDevice,
+                UseFlashAttention = options.UseFlashAttention
+            };
+
+            log.Info(
+                $"Initializing whisper factory. ModelPath={modelPath} UseGpu={factoryOptions.UseGpu} GpuDevice={factoryOptions.GpuDevice} UseFlashAttention={factoryOptions.UseFlashAttention}");
+            factory = WhisperFactory.FromPath(modelPath, factoryOptions);
+            var runtimeInfo = WhisperFactory.GetRuntimeInfo() ?? string.Empty;
+            log.Info($"Whisper runtime info: {runtimeInfo}");
+            EnforceRuntimeExpectation(runtimeInfo);
+            return factory;
+        }
+        finally
+        {
+            initializationLock.Release();
+        }
     }
 
     private void EnforceRuntimeExpectation(string runtimeInfo)
