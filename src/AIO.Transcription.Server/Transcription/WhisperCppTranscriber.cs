@@ -20,17 +20,38 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         this.log = log;
     }
 
-    public async Task<string> TranscribeWaveAsync(byte[] waveBytes, CancellationToken cancellationToken)
+    public async Task WarmUpAsync(CancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(waveBytes);
-        if (waveBytes.Length == 0)
+        _ = await GetFactoryAsync(cancellationToken);
+    }
+
+    public async Task<string> TranscribeWaveAsync(WaveTranscriptionRequest request, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(request.WaveBytes);
+        if (request.WaveBytes.Length == 0)
         {
             return string.Empty;
         }
 
         var currentFactory = await GetFactoryAsync(cancellationToken);
-        await using var processor = currentFactory.CreateBuilder().WithLanguage("auto").Build();
-        using var stream = new MemoryStream(waveBytes, writable: false);
+        var builder = currentFactory.CreateBuilder();
+        if (!string.IsNullOrWhiteSpace(request.Prompt))
+        {
+            builder = builder.WithPrompt(request.Prompt);
+        }
+
+        if (request.EnableLanguageDetection || string.Equals(request.Language, "auto", StringComparison.OrdinalIgnoreCase))
+        {
+            builder = builder.WithLanguageDetection();
+        }
+        else if (!string.IsNullOrWhiteSpace(request.Language))
+        {
+            builder = builder.WithLanguage(request.Language);
+        }
+
+        await using var processor = builder.Build();
+        using var stream = new MemoryStream(request.WaveBytes, writable: false);
         var transcript = new StringBuilder();
         await foreach (var segment in processor.ProcessAsync(stream, cancellationToken))
         {
@@ -49,7 +70,8 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         }
 
         var result = transcript.ToString().Trim();
-        log.Info($"Completed whisper transcription. WaveBytes={waveBytes.Length} TranscriptChars={result.Length}");
+        log.Info(
+            $"Completed whisper transcription. WaveBytes={request.WaveBytes.Length} TranscriptChars={result.Length} Language={request.Language ?? "<auto>"} PromptChars={request.Prompt?.Length ?? 0} DetectLanguage={request.EnableLanguageDetection}");
         return result;
     }
 

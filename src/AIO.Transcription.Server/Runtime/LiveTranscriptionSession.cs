@@ -27,6 +27,7 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
     private readonly TranscriptionSessionSnapshot snapshot;
     private readonly Task processingTask;
     private string lastTranscriptSegment = string.Empty;
+    private string transcriptPromptContext = string.Empty;
     private bool acceptingAudio = true;
     private bool flushPendingAudioOnCompletion;
     private Exception? processingFailure;
@@ -223,7 +224,12 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
             $"Transcription window reached. SessionId={SessionId} WindowChunkCount={window.Length} PendingMilliseconds={pendingMilliseconds:F2} BufferWindowMilliseconds={options.BufferWindowMillisecondsResolved} TargetSampleRate={options.TargetSampleRate} IsFinal={isFinal}");
 
         var waveBytes = WavePcm16Writer.WriteWaveFile(window, options.TargetSampleRate);
-        var text = (await transcriber.TranscribeWaveAsync(waveBytes, cancellationToken)).Trim();
+        var request = new WaveTranscriptionRequest(
+            waveBytes,
+            GetPromptContext(),
+            options.Language,
+            options.EnableLanguageDetection);
+        var text = (await transcriber.TranscribeWaveAsync(request, cancellationToken)).Trim();
         if (string.IsNullOrWhiteSpace(text))
         {
             return;
@@ -236,6 +242,7 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         }
 
         lastTranscriptSegment = text;
+        AppendPromptContext(text);
         log.Info($"Transcript segment updated. SessionId={SessionId} TranscriptChars={text.Length} IsFinal={isFinal}");
 
         updatesChannel.Writer.TryWrite(new ServerEnvelope
@@ -248,6 +255,34 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
             ReceivedChunkCount = CreateSnapshot().ReceivedChunkCount,
             ReceivedAudioBytes = CreateSnapshot().ReceivedAudioBytes,
         });
+    }
+
+    private string? GetPromptContext()
+    {
+        lock (sync)
+        {
+            return string.IsNullOrWhiteSpace(transcriptPromptContext) ? null : transcriptPromptContext;
+        }
+    }
+
+    private void AppendPromptContext(string text)
+    {
+        if (options.PromptContextCharactersResolved <= 0 || string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        lock (sync)
+        {
+            transcriptPromptContext = string.IsNullOrWhiteSpace(transcriptPromptContext)
+                ? text
+                : $"{transcriptPromptContext} {text}".Trim();
+
+            if (transcriptPromptContext.Length > options.PromptContextCharactersResolved)
+            {
+                transcriptPromptContext = transcriptPromptContext[^options.PromptContextCharactersResolved..].TrimStart();
+            }
+        }
     }
 
     private bool ShouldFlushPendingAudio()
