@@ -18,7 +18,9 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
     {
         this.options = options;
         this.log = log;
-    }    public async Task WarmUpAsync(CancellationToken cancellationToken)
+    }
+
+    public async Task WarmUpAsync(CancellationToken cancellationToken)
     {
         _ = await GetFactoryAsync(cancellationToken);
     }
@@ -106,9 +108,7 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
 
         var modelDirectory = Path.Combine(AppContext.BaseDirectory, "models");
         Directory.CreateDirectory(modelDirectory);
-        var ggmlType = Enum.TryParse<GgmlType>(options.ModelType, true, out var parsed)
-            ? parsed
-            : GgmlType.TinyEn;
+        var ggmlType = ParseModelType(options.ModelType);
         var extension = GetModelFileStem(ggmlType);
         var targetPath = Path.Combine(modelDirectory, $"ggml-{extension}.bin");
         if (!File.Exists(targetPath))
@@ -125,6 +125,39 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         resolvedModelPath = targetPath;
         log.Info($"Resolved whisper model path. ModelPath={resolvedModelPath}");
         return resolvedModelPath;
+    }
+
+    private static GgmlType ParseModelType(string? modelType)
+    {
+        if (string.IsNullOrWhiteSpace(modelType))
+        {
+            return GgmlType.BaseEn;
+        }
+
+        var normalized = modelType.Trim();
+        if (Enum.TryParse<GgmlType>(normalized, true, out var enumParsed))
+        {
+            return enumParsed;
+        }
+
+        normalized = normalized.ToLowerInvariant().Replace('_', '-');
+        return normalized switch
+        {
+            "tiny.en" => GgmlType.TinyEn,
+            "base.en" => GgmlType.BaseEn,
+            "small.en" => GgmlType.SmallEn,
+            "medium.en" => GgmlType.MediumEn,
+            "tiny" => GgmlType.Tiny,
+            "base" => GgmlType.Base,
+            "small" => GgmlType.Small,
+            "medium" => GgmlType.Medium,
+            "large-v1" => GgmlType.LargeV1,
+            "large-v2" => GgmlType.LargeV2,
+            "large-v3" => GgmlType.LargeV3,
+            "large-v3-turbo" => GgmlType.LargeV3Turbo,
+            _ => throw new InvalidOperationException(
+                $"Unsupported Transcription:ModelType '{modelType}'. Use whisper.cpp-style names such as 'base.en', 'medium.en', 'base', 'medium', 'large-v3', or 'large-v3-turbo'.")
+        };
     }
 
     private static string GetModelFileStem(GgmlType ggmlType)

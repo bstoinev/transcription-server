@@ -7,7 +7,7 @@ public sealed class WhisperTranscriberOptions
 
     public string? ModelPath { get; set; }
     public bool AutoDownloadModel { get; set; } = true;
-    public string ModelType { get; set; } = "BaseEn";
+    public string ModelType { get; set; } = "base.en";
     public int TargetSampleRate { get; set; } = 16000;
     public int? BufferWindowMilliseconds { get; set; } = DefaultBufferWindowMilliseconds;
     public int? MinimumWindowMilliseconds { get; set; }
