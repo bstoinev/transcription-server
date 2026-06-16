@@ -65,6 +65,9 @@ app.Map("/ws/transcribe", async context =>
     LiveTranscriptionSession? activeSession = null;
     Task? updateForwardingTask = null;
     string currentSessionId = string.Empty;
+    string? activeEncoding = null;
+    int? activeSampleRate = null;
+    int? activeChannels = null;
     logger.Info(
         $"Accepted websocket connection. Remote={context.Connection.RemoteIpAddress}:{context.Connection.RemotePort} Local={context.Connection.LocalIpAddress}:{context.Connection.LocalPort}");
 
@@ -75,17 +78,71 @@ app.Map("/ws/transcribe", async context =>
     }, context.RequestAborted);
     while (socket.State == WebSocketState.Open && !context.RequestAborted.IsCancellationRequested)
     {
-        var messageBytes = await ReceiveMessageAsync(socket, buffer, context.RequestAborted);
-        if (messageBytes is null)
+        var receivedMessage = await ReceiveMessageAsync(socket, buffer, context.RequestAborted);
+        if (receivedMessage is null)
         {
             logger.Info($"Client initiated websocket close. ActiveSessionId={currentSessionId}");
             break;
         }
 
+        if (receivedMessage.Value.MessageType == WebSocketMessageType.Binary)
+        {
+            try
+            {
+                if (activeSession is null || string.IsNullOrWhiteSpace(currentSessionId))
+                {
+                    await TrySendEnvelopeAsync(new ServerEnvelope { Type = "error", Message = "No active session. Send start-session first." }, context.RequestAborted);
+                    continue;
+                }
+
+                if (string.IsNullOrWhiteSpace(activeEncoding) || activeSampleRate is null || activeChannels is null)
+                {
+                    await TrySendEnvelopeAsync(new ServerEnvelope
+                    {
+                        Type = "error",
+                        SessionId = currentSessionId,
+                        Message = "Binary audio requires encoding, sampleRate, and channels to be established by start-session or a prior audio-chunk."
+                    }, context.RequestAborted);
+                    continue;
+                }
+
+                var audioBytes = receivedMessage.Value.Payload.ToArray();
+                await activeSession.AddAudioChunkAsync(new AudioChunk(
+                    audioBytes,
+                    audioBytes.Length,
+                    activeSampleRate.Value,
+                    activeChannels.Value,
+                    activeEncoding,
+                    DateTimeOffset.UtcNow), context.RequestAborted);
+                continue;
+            }
+            catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+            {
+                logger.Warn($"Request aborted while processing websocket binary audio. SessionId={currentSessionId}");
+                break;
+            }
+            catch (Exception ex)
+            {
+                logger.Error($"WebSocket binary message processing failed. SessionId={currentSessionId}", ex);
+                if (socket.State == WebSocketState.Open)
+                {
+                    await TrySendEnvelopeAsync(new ServerEnvelope
+                    {
+                        Type = "error",
+                        SessionId = currentSessionId,
+                        Message = $"Server failed to process binary audio: {ex.Message}"
+                    }, context.RequestAborted);
+                    await socket.CloseAsync(WebSocketCloseStatus.InternalServerError, "server-processing-failed", context.RequestAborted);
+                }
+
+                break;
+            }
+        }
+
         ClientEnvelope? clientEnvelope;
         try
         {
-            clientEnvelope = JsonSerializer.Deserialize<ClientEnvelope>(messageBytes.Value.Span, JsonOptions.WebSocket);
+            clientEnvelope = JsonSerializer.Deserialize<ClientEnvelope>(receivedMessage.Value.Payload.Span, JsonOptions.WebSocket);
         }
         catch (JsonException ex)
         {
@@ -142,6 +199,9 @@ app.Map("/ws/transcribe", async context =>
 
                     activeSession = started;
                     currentSessionId = started.SessionId;
+                    activeEncoding = NormalizeEncoding(clientEnvelope.Encoding);
+                    activeSampleRate = clientEnvelope.SampleRate;
+                    activeChannels = clientEnvelope.Channels;
                     updateForwardingTask = ForwardSessionUpdatesAsync(started, TrySendEnvelopeAsync, logger, context.RequestAborted);
                     var startedSnapshot = started.CreateSnapshot();
                     logger.Info(
@@ -192,23 +252,20 @@ app.Map("/ws/transcribe", async context =>
                         continue;
                     }
 
+                    var resolvedEncoding = NormalizeEncoding(clientEnvelope.Encoding) ?? activeEncoding ?? "f32le";
+                    var resolvedSampleRate = clientEnvelope.SampleRate ?? activeSampleRate ?? 48000;
+                    var resolvedChannels = clientEnvelope.Channels ?? activeChannels ?? 2;
+                    activeEncoding = resolvedEncoding;
+                    activeSampleRate = resolvedSampleRate;
+                    activeChannels = resolvedChannels;
+
                     await activeSession.AddAudioChunkAsync(new AudioChunk(
                         audioBytes,
                         audioBytes.Length,
-                        clientEnvelope.SampleRate ?? 48000,
-                        clientEnvelope.Channels ?? 2,
-                        clientEnvelope.Encoding ?? "f32le",
+                        resolvedSampleRate,
+                        resolvedChannels,
+                        resolvedEncoding,
                         DateTimeOffset.UtcNow), context.RequestAborted);
-                    var sessionSnapshot = activeSession.CreateSnapshot();
-
-                    await TrySendEnvelopeAsync(new ServerEnvelope
-                    {
-                        Type = "audio-ack",
-                        SessionId = currentSessionId,
-                        Message = "Audio chunk received.",
-                        ReceivedChunkCount = sessionSnapshot.ReceivedChunkCount,
-                        ReceivedAudioBytes = sessionSnapshot.ReceivedAudioBytes,
-                    }, context.RequestAborted);
                     break;
 
                 case "simulate-text":
@@ -280,6 +337,9 @@ app.Map("/ws/transcribe", async context =>
                         context.RequestAborted);
                     activeSession = null;
                     updateForwardingTask = null;
+                    activeEncoding = null;
+                    activeSampleRate = null;
+                    activeChannels = null;
                     currentSessionId = string.Empty;
                     break;
 
@@ -368,7 +428,7 @@ app.Map("/ws/transcribe", async context =>
 
 await app.RunAsync();
 
-static async Task<ReadOnlyMemory<byte>?> ReceiveMessageAsync(WebSocket socket, byte[] buffer, CancellationToken cancellationToken)
+static async Task<ReceivedSocketMessage?> ReceiveMessageAsync(WebSocket socket, byte[] buffer, CancellationToken cancellationToken)
 {
     var writer = new ArrayBufferWriter<byte>();
     while (true)
@@ -389,7 +449,7 @@ static async Task<ReadOnlyMemory<byte>?> ReceiveMessageAsync(WebSocket socket, b
         writer.Advance(result.Count);
         if (result.EndOfMessage)
         {
-            return writer.WrittenMemory;
+            return new ReceivedSocketMessage(result.MessageType, writer.WrittenMemory);
         }
     }
 }
@@ -518,6 +578,16 @@ static void WriteBootstrapTrace(string contentRootPath, string message)
     }
 }
 
+static string? NormalizeEncoding(string? encoding)
+{
+    if (string.IsNullOrWhiteSpace(encoding))
+    {
+        return null;
+    }
+
+    return encoding.Trim();
+}
+
 static class JsonOptions
 {
     public static readonly JsonSerializerOptions WebSocket = new(JsonSerializerDefaults.Web)
@@ -530,3 +600,5 @@ static class JsonOptions
         WriteIndented = true
     };
 }
+
+readonly record struct ReceivedSocketMessage(WebSocketMessageType MessageType, ReadOnlyMemory<byte> Payload);
