@@ -84,10 +84,10 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
             return resolvedModelPath;
         }
 
-        var modelDirectory = ResolveModelDirectory();
+        var modelDirectory = WhisperModelCatalog.ResolveModelDirectory(options);
         Directory.CreateDirectory(modelDirectory);
-        var (ggmlType, modelStem) = ResolveModelDefinition(options.ModelType);
-        var targetPath = ResolveConfiguredModelPath(modelDirectory, modelStem);
+        var modelDefinition = WhisperModelCatalog.Resolve(options.ModelType);
+        var targetPath = WhisperModelCatalog.ResolveModelPath(options, modelDefinition.Id);
         if (!File.Exists(targetPath))
         {
             if (!options.AutoDownloadModel)
@@ -96,9 +96,9 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
                     $"Whisper model was not found at {targetPath}, and auto-download is disabled.");
             }
 
-            log.Info($"Downloading whisper model. ModelType={ggmlType} TargetPath={targetPath}");
+            log.Info($"Downloading whisper model. ModelType={modelDefinition.Id} TargetPath={targetPath}");
             await using var modelStream = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(
-                ggmlType,
+                modelDefinition.GgmlType,
                 QuantizationType.NoQuantization,
                 cancellationToken);
             await using var fileStream = File.Create(targetPath);
@@ -108,109 +108,6 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         resolvedModelPath = targetPath;
         log.Info($"Resolved whisper model path. ModelPath={resolvedModelPath}");
         return resolvedModelPath;
-    }
-
-    private string ResolveModelDirectory()
-    {
-        if (string.IsNullOrWhiteSpace(options.ModelPath))
-        {
-            return Path.Combine(AppContext.BaseDirectory, "models");
-        }
-
-        var configuredPath = options.ModelPath.Trim();
-        if (Directory.Exists(configuredPath))
-        {
-            return configuredPath;
-        }
-
-        if (File.Exists(configuredPath))
-        {
-            return Path.GetDirectoryName(configuredPath)
-                ?? throw new InvalidOperationException($"Whisper model path '{configuredPath}' does not have a valid parent directory.");
-        }
-
-        if (Path.HasExtension(configuredPath))
-        {
-            var parentDirectory = Path.GetDirectoryName(configuredPath);
-            if (string.IsNullOrWhiteSpace(parentDirectory))
-            {
-                throw new FileNotFoundException($"Whisper model was not found at {configuredPath}");
-            }
-
-            Directory.CreateDirectory(parentDirectory);
-            return parentDirectory;
-        }
-
-        Directory.CreateDirectory(configuredPath);
-        return configuredPath;
-    }
-
-    private string ResolveConfiguredModelPath(string modelDirectory, string modelStem)
-    {
-        if (!string.IsNullOrWhiteSpace(options.ModelPath))
-        {
-            var configuredPath = options.ModelPath.Trim();
-            if (File.Exists(configuredPath))
-            {
-                return configuredPath;
-            }
-
-            if (Path.HasExtension(configuredPath))
-            {
-                return configuredPath;
-            }
-        }
-
-        return Path.Combine(modelDirectory, $"ggml-{modelStem}.bin");
-    }
-
-    private static (GgmlType GgmlType, string FileStem) ResolveModelDefinition(string? modelType)
-    {
-        if (string.IsNullOrWhiteSpace(modelType))
-        {
-            return (GgmlType.BaseEn, "base.en");
-        }
-
-        var normalized = modelType.Trim();
-        if (Enum.TryParse<GgmlType>(normalized, true, out var enumParsed))
-        {
-            return (enumParsed, GetModelFileStem(enumParsed));
-        }
-
-        normalized = normalized.ToLowerInvariant().Replace('_', '-');
-        return normalized switch
-        {
-            "tiny.en" => (GgmlType.TinyEn, "tiny.en"),
-            "base.en" => (GgmlType.BaseEn, "base.en"),
-            "small.en" => (GgmlType.SmallEn, "small.en"),
-            "medium.en" => (GgmlType.MediumEn, "medium.en"),
-            "tiny" => (GgmlType.Tiny, "tiny"),
-            "base" => (GgmlType.Base, "base"),
-            "small" => (GgmlType.Small, "small"),
-            "medium" => (GgmlType.Medium, "medium"),
-            "large-v1" => (GgmlType.LargeV1, "large-v1"),
-            "large-v2" => (GgmlType.LargeV2, "large-v2"),
-            "large-v3" => (GgmlType.LargeV3, "large-v3"),
-            "large-v3-turbo" => (GgmlType.LargeV3Turbo, "large-v3-turbo"),
-            _ => throw new InvalidOperationException(
-                $"Unsupported Transcription:ModelType '{modelType}'. Use the whisper.cpp stem that comes after 'ggml-' in the filename, such as 'base.en', 'medium.en', 'base', 'medium', 'large-v3', or 'large-v3-turbo'.")
-        };
-    }
-
-    private static string GetModelFileStem(GgmlType ggmlType)
-    {
-        return ggmlType switch
-        {
-            GgmlType.TinyEn => "tiny.en",
-            GgmlType.BaseEn => "base.en",
-            GgmlType.SmallEn => "small.en",
-            GgmlType.MediumEn => "medium.en",
-            GgmlType.LargeV1 => "large-v1",
-            GgmlType.LargeV2 => "large-v2",
-            GgmlType.LargeV3 => "large-v3",
-            GgmlType.LargeV3Turbo => "large-v3-turbo",
-            _ => ggmlType.ToString().ToLowerInvariant().Replace('_', '-')
-        };
     }
 
     private async Task<WhisperFactory> GetFactoryAsync(CancellationToken cancellationToken)

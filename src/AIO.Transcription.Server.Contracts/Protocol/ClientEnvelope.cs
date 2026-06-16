@@ -9,6 +9,9 @@ public sealed class ClientEnvelope
     public string? Encoding { get; set; }
     public int? SampleRate { get; set; }
     public int? Channels { get; set; }
+    public string? ModelType { get; set; }
+    public string? Language { get; set; }
+    public bool? EnableLanguageDetection { get; set; }
     public bool? IsFinalChunk { get; set; }
     public string? SimulatedText { get; set; }
 }

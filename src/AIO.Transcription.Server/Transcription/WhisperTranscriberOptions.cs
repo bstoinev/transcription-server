@@ -19,6 +19,26 @@ public sealed class WhisperTranscriberOptions
     public bool EnableLanguageDetection { get; set; }
     public int PromptContextCharacters { get; set; } = DefaultPromptContextCharacters;
 
+    public WhisperTranscriberOptions Clone()
+    {
+        return new WhisperTranscriberOptions
+        {
+            ModelPath = ModelPath,
+            AutoDownloadModel = AutoDownloadModel,
+            ModelType = ModelType,
+            TargetSampleRate = TargetSampleRate,
+            BufferWindowMilliseconds = BufferWindowMilliseconds,
+            MinimumWindowMilliseconds = MinimumWindowMilliseconds,
+            UseGpu = UseGpu,
+            AllowCpuFallback = AllowCpuFallback,
+            GpuDevice = GpuDevice,
+            UseFlashAttention = UseFlashAttention,
+            Language = Language,
+            EnableLanguageDetection = EnableLanguageDetection,
+            PromptContextCharacters = PromptContextCharacters,
+        };
+    }
+
     public int BufferWindowMillisecondsResolved =>
         NormalizeBufferWindowMilliseconds(BufferWindowMilliseconds)
         ?? NormalizeBufferWindowMilliseconds(MinimumWindowMilliseconds)

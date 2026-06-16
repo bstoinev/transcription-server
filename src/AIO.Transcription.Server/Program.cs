@@ -28,7 +28,6 @@ builder.Services.ConfigureHttpJsonOptions(options =>
 builder.Services.AddSingleton(whisperOptions);
 builder.Services.AddLogMachina(x => x.WithNLog(ServiceLifetime.Singleton));
 builder.Services.AddHostedService<LoggingLifecycleHostedService>();
-builder.Services.AddSingleton<IWaveTranscriber, WhisperCppTranscriber>();
 builder.Services.AddSingleton<SessionRegistry>();
 
 var app = builder.Build();
@@ -42,7 +41,7 @@ app.MapGet("/healthz", (WhisperTranscriberOptions options) => Results.Ok(new
     status = "ok",
     timeUtc = DateTimeOffset.UtcNow,
     bufferWindowMilliseconds = options.BufferWindowMillisecondsResolved,
-    modelType = options.ModelType,
+    modelType = WhisperModelCatalog.GetEffectiveConfiguredModelType(options),
     targetSampleRate = options.TargetSampleRate
 }));
 app.MapGet("/sessions", (SessionRegistry registry) => Results.Ok(registry.GetAll()));
@@ -71,10 +70,13 @@ app.Map("/ws/transcribe", async context =>
     logger.Info(
         $"Accepted websocket connection. Remote={context.Connection.RemoteIpAddress}:{context.Connection.RemotePort} Local={context.Connection.LocalIpAddress}:{context.Connection.LocalPort}");
 
+    var capabilities = WhisperModelCatalog.BuildCapabilities(
+        context.RequestServices.GetRequiredService<WhisperTranscriberOptions>());
     await TrySendEnvelopeAsync(new ServerEnvelope
     {
         Type = "server-ready",
-        Message = "Connected. Send start-session first."
+        Message = "Connected. Select a model and send start-session first.",
+        Capabilities = capabilities
     }, context.RequestAborted);
     while (socket.State == WebSocketState.Open && !context.RequestAborted.IsCancellationRequested)
     {
@@ -186,13 +188,33 @@ app.Map("/ws/transcribe", async context =>
                         continue;
                     }
 
-                    if (!registry.TryCreate(clientEnvelope.SessionId, out var started))
+                    WhisperTranscriberOptions sessionOptions;
+                    try
+                    {
+                        sessionOptions = WhisperModelCatalog.CreateSessionOptions(
+                            context.RequestServices.GetRequiredService<WhisperTranscriberOptions>(),
+                            clientEnvelope.ModelType,
+                            clientEnvelope.Language,
+                            clientEnvelope.EnableLanguageDetection);
+                    }
+                    catch (InvalidOperationException ex)
                     {
                         await TrySendEnvelopeAsync(new ServerEnvelope
                         {
                             Type = "error",
                             SessionId = clientEnvelope.SessionId,
-                            Message = "A session with the same sessionId is already active."
+                            Message = ex.Message
+                        }, context.RequestAborted);
+                        continue;
+                    }
+
+                    if (!registry.TryCreate(clientEnvelope.SessionId, sessionOptions, out var started, out var rejectionReason))
+                    {
+                        await TrySendEnvelopeAsync(new ServerEnvelope
+                        {
+                            Type = "error",
+                            SessionId = clientEnvelope.SessionId,
+                            Message = rejectionReason ?? "Unable to create session."
                         }, context.RequestAborted);
                         continue;
                     }
@@ -205,12 +227,13 @@ app.Map("/ws/transcribe", async context =>
                     updateForwardingTask = ForwardSessionUpdatesAsync(started, TrySendEnvelopeAsync, logger, context.RequestAborted);
                     var startedSnapshot = started.CreateSnapshot();
                     logger.Info(
-                        $"Session started. SessionId={started.SessionId} Encoding={clientEnvelope.Encoding ?? "<null>"} SampleRate={clientEnvelope.SampleRate?.ToString() ?? "<null>"} Channels={clientEnvelope.Channels?.ToString() ?? "<null>"}");
+                        $"Session started. SessionId={started.SessionId} ModelType={started.ModelType} Encoding={clientEnvelope.Encoding ?? "<null>"} SampleRate={clientEnvelope.SampleRate?.ToString() ?? "<null>"} Channels={clientEnvelope.Channels?.ToString() ?? "<null>"}");
                     await TrySendEnvelopeAsync(new ServerEnvelope
                     {
                         Type = "session-started",
                         SessionId = started.SessionId,
                         Message = "Session registered.",
+                        ModelType = started.ModelType,
                         ReceivedChunkCount = startedSnapshot.ReceivedChunkCount,
                         ReceivedAudioBytes = startedSnapshot.ReceivedAudioBytes,
                     }, context.RequestAborted);

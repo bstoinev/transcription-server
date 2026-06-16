@@ -36,6 +36,7 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
     public LiveTranscriptionSession(string sessionId, IWaveTranscriber transcriber, WhisperTranscriberOptions options, ILogMachina<LiveTranscriptionSession> log)
     {
         SessionId = sessionId;
+        ModelType = WhisperModelCatalog.GetEffectiveConfiguredModelType(options);
         this.transcriber = transcriber;
         this.options = options;
         this.log = log;
@@ -46,10 +47,11 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
             UpdatedAtUtc = DateTimeOffset.UtcNow,
         };
         processingTask = ProcessChunksAsync();
-        this.log.Info($"Initialized live transcription session. SessionId={sessionId}");
+        this.log.Info($"Initialized live transcription session. SessionId={sessionId} ModelType={ModelType} Language={options.Language ?? "<auto>"} EnableLanguageDetection={options.EnableLanguageDetection}");
     }
 
     public string SessionId { get; }
+    public string ModelType { get; }
 
     public async Task AddAudioChunkAsync(AudioChunk chunk, CancellationToken cancellationToken)
     {
@@ -103,6 +105,7 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
             Type = "session-ended",
             SessionId = SessionId,
             Message = "Session ended.",
+            ModelType = ModelType,
             ReceivedChunkCount = snapshotCopy.ReceivedChunkCount,
             ReceivedAudioBytes = snapshotCopy.ReceivedAudioBytes,
         };
@@ -132,6 +135,18 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         }
         catch (OperationCanceledException) when (lifetimeCts.IsCancellationRequested)
         {
+        }
+        finally
+        {
+            switch (transcriber)
+            {
+                case IAsyncDisposable asyncDisposable:
+                    await asyncDisposable.DisposeAsync();
+                    break;
+                case IDisposable disposable:
+                    disposable.Dispose();
+                    break;
+            }
         }
 
         lifetimeCts.Dispose();
@@ -250,6 +265,7 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
             Type = "transcript",
             SessionId = SessionId,
             Message = "Transcript updated.",
+            ModelType = ModelType,
             TranscriptText = text,
             IsFinal = isFinal,
             ReceivedChunkCount = CreateSnapshot().ReceivedChunkCount,
