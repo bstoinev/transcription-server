@@ -208,17 +208,39 @@ app.Map("/ws/transcribe", async context =>
                         continue;
                     }
 
-                    if (!registry.TryCreate(clientEnvelope.SessionId, sessionOptions, out var started, out var rejectionReason))
+                    SessionCreateResult createResult;
+                    try
+                    {
+                        createResult = await registry.TryCreateAsync(clientEnvelope.SessionId, sessionOptions, context.RequestAborted);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.Error(
+                            $"Session warm-up failed. SessionId={clientEnvelope.SessionId} ModelType={sessionOptions.ModelType}",
+                            ex);
+                        await TrySendEnvelopeAsync(new ServerEnvelope
+                        {
+                            Type = "error",
+                            SessionId = clientEnvelope.SessionId,
+                            ModelType = sessionOptions.ModelType,
+                            Message = $"Unable to start session: {ex.Message}"
+                        }, context.RequestAborted);
+                        continue;
+                    }
+
+                    if (!createResult.Created || createResult.Session is null)
                     {
                         await TrySendEnvelopeAsync(new ServerEnvelope
                         {
                             Type = "error",
                             SessionId = clientEnvelope.SessionId,
-                            Message = rejectionReason ?? "Unable to create session."
+                            ModelType = sessionOptions.ModelType,
+                            Message = createResult.RejectionReason ?? "Unable to create session."
                         }, context.RequestAborted);
                         continue;
                     }
 
+                    var started = createResult.Session;
                     activeSession = started;
                     currentSessionId = started.SessionId;
                     activeEncoding = NormalizeEncoding(clientEnvelope.Encoding);
@@ -232,7 +254,7 @@ app.Map("/ws/transcribe", async context =>
                     {
                         Type = "session-started",
                         SessionId = started.SessionId,
-                        Message = "Session registered.",
+                        Message = "Session registered and warmed up.",
                         ModelType = started.ModelType,
                         ReceivedChunkCount = startedSnapshot.ReceivedChunkCount,
                         ReceivedAudioBytes = startedSnapshot.ReceivedAudioBytes,

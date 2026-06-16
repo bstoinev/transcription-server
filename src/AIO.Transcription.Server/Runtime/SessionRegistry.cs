@@ -11,6 +11,7 @@ public sealed class SessionRegistry
     private readonly ILogMachinaFactory logFactory;
     private readonly ILogMachina<SessionRegistry> log;
     private readonly object sync = new();
+    private string? provisioningSessionId;
 
     public SessionRegistry(ILogMachinaFactory logFactory, ILogMachina<SessionRegistry> log)
     {
@@ -18,31 +19,67 @@ public sealed class SessionRegistry
         this.log = log;
     }
 
-    public bool TryCreate(string sessionId, WhisperTranscriberOptions options, out LiveTranscriptionSession session, out string? rejectionReason)
+    public async Task<SessionCreateResult> TryCreateAsync(string sessionId, WhisperTranscriberOptions options, CancellationToken cancellationToken)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(sessionId);
+        ArgumentNullException.ThrowIfNull(options);
+
         lock (sync)
         {
-            rejectionReason = null;
-            if (sessions.TryGetValue(sessionId, out session!))
+            if (sessions.TryGetValue(sessionId, out _))
             {
-                rejectionReason = "A session with the same sessionId is already active.";
+                var rejectionReason = "A session with the same sessionId is already active.";
                 log.Warn($"Rejected duplicate live transcription session creation. SessionId={sessionId} ActiveSessionCount={sessions.Count}");
-                return false;
+                return SessionCreateResult.FromRejection(rejectionReason);
             }
 
-            if (sessions.Count > 0)
+            if (string.Equals(provisioningSessionId, sessionId, StringComparison.OrdinalIgnoreCase))
             {
-                rejectionReason = "The server already has an active transcription session.";
-                log.Warn($"Rejected live transcription session creation because the server is already at capacity. SessionId={sessionId} ActiveSessionCount={sessions.Count}");
-                session = null!;
-                return false;
+                const string rejectionReason = "A session with the same sessionId is already being prepared.";
+                log.Warn($"Rejected duplicate provisioning request for live transcription session. SessionId={sessionId} ActiveSessionCount={sessions.Count}");
+                return SessionCreateResult.FromRejection(rejectionReason);
             }
 
-            var transcriber = new WhisperCppTranscriber(options, logFactory.Create<WhisperCppTranscriber>());
-            session = new LiveTranscriptionSession(sessionId, transcriber, options, logFactory.Create<LiveTranscriptionSession>());
-            sessions[sessionId] = session;
-            log.Info($"Created live transcription session. SessionId={sessionId} ModelType={options.ModelType} ActiveSessionCount={sessions.Count}");
-            return true;
+            if (sessions.Count > 0 || provisioningSessionId is not null)
+            {
+                var rejectionReason = "The server already has an active transcription session.";
+                log.Warn($"Rejected live transcription session creation because the server is already at capacity. SessionId={sessionId} ActiveSessionCount={sessions.Count} ProvisioningSessionId={provisioningSessionId ?? "<none>"}");
+                return SessionCreateResult.FromRejection(rejectionReason);
+            }
+
+            provisioningSessionId = sessionId;
+        }
+
+        WhisperCppTranscriber? transcriber = null;
+        try
+        {
+            transcriber = new WhisperCppTranscriber(options, logFactory.Create<WhisperCppTranscriber>());
+            await transcriber.WarmUpAsync(cancellationToken);
+
+            var session = new LiveTranscriptionSession(sessionId, transcriber, options, logFactory.Create<LiveTranscriptionSession>());
+
+            lock (sync)
+            {
+                sessions[sessionId] = session;
+                provisioningSessionId = null;
+                log.Info($"Created live transcription session. SessionId={sessionId} ModelType={options.ModelType} ActiveSessionCount={sessions.Count}");
+            }
+
+            transcriber = null;
+            return SessionCreateResult.FromSession(session);
+        }
+        catch
+        {
+            lock (sync)
+            {
+                if (string.Equals(provisioningSessionId, sessionId, StringComparison.OrdinalIgnoreCase))
+                {
+                    provisioningSessionId = null;
+                }
+            }
+
+            transcriber?.Dispose();
+            throw;
         }
     }
 
@@ -77,4 +114,11 @@ public sealed class SessionRegistry
             return session;
         }
     }
+}
+
+public sealed record SessionCreateResult(bool Created, LiveTranscriptionSession? Session, string? RejectionReason)
+{
+    public static SessionCreateResult FromRejection(string reason) => new(false, null, reason);
+
+    public static SessionCreateResult FromSession(LiveTranscriptionSession session) => new(true, session, null);
 }

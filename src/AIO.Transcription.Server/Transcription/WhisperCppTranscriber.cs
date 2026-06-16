@@ -20,6 +20,13 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         this.log = log;
     }
 
+    public async Task WarmUpAsync(CancellationToken cancellationToken)
+    {
+        log.Info($"Starting whisper warm-up. ModelType={options.ModelType} Language={options.Language ?? "<auto>"}");
+        await GetFactoryAsync(cancellationToken);
+        log.Info($"Completed whisper warm-up. ModelType={options.ModelType}");
+    }
+
     public async Task<string> TranscribeWaveAsync(WaveTranscriptionRequest request, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
