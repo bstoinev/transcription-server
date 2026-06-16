@@ -57,14 +57,12 @@ public sealed class LiveTranscriptionSession
             snapshot.LastChannels = chunk.Channels;
 
             var pendingMs = pendingChunks.Sum(WavePcm16Writer.EstimateChunkMilliseconds);
-            log.Trace(
-                $"Buffered audio chunk. SessionId={SessionId} ChunkBytes={chunk.BytesRecorded} PendingChunkCount={pendingChunks.Count} PendingMilliseconds={pendingMs:F2} ReceivedChunkCount={snapshot.ReceivedChunkCount}");
-            if (pendingMs >= options.MinimumWindowMilliseconds)
+            if (pendingMs >= options.BufferWindowMillisecondsResolved)
             {
                 window = [.. pendingChunks];
                 pendingChunks.Clear();
                 log.Info(
-                    $"Transcription window reached. SessionId={SessionId} WindowChunkCount={window.Count} PendingMilliseconds={pendingMs:F2} TargetSampleRate={options.TargetSampleRate}");
+                    $"Transcription window reached. SessionId={SessionId} WindowChunkCount={window.Count} PendingMilliseconds={pendingMs:F2} BufferWindowMilliseconds={options.BufferWindowMillisecondsResolved} TargetSampleRate={options.TargetSampleRate}");
             }
 
             snapshotCopy = CloneSnapshot(snapshot);
@@ -76,11 +74,9 @@ public sealed class LiveTranscriptionSession
         }
 
         var waveBytes = WavePcm16Writer.WriteWaveFile(window, options.TargetSampleRate);
-        log.Debug($"Prepared wave payload for transcription. SessionId={SessionId} WaveBytes={waveBytes.Length}");
         var text = (await transcriber.TranscribeWaveAsync(waveBytes, cancellationToken)).Trim();
         if (string.IsNullOrWhiteSpace(text))
         {
-            log.Debug($"Transcription returned no text. SessionId={SessionId}");
             return null;
         }
 
@@ -88,7 +84,7 @@ public sealed class LiveTranscriptionSession
         {
             if (string.Equals(lastTranscriptSegment, text, StringComparison.OrdinalIgnoreCase))
             {
-                log.Debug($"Skipping duplicate transcript segment. SessionId={SessionId}");
+                log.Trace($"Skipping duplicate transcript segment. SessionId={SessionId}");
                 return null;
             }
 

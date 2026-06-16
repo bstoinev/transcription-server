@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -22,8 +23,8 @@ builder.Configuration.GetSection("Transcription").Bind(whisperOptions);
 
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
-    options.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
-    options.SerializerOptions.WriteIndented = true;
+    options.SerializerOptions.PropertyNamingPolicy = JsonOptions.Http.PropertyNamingPolicy;
+    options.SerializerOptions.WriteIndented = JsonOptions.Http.WriteIndented;
 });
 builder.Services.AddSingleton(whisperOptions);
 builder.Services.AddLogMachina(x => x.WithNLog(ServiceLifetime.Singleton));
@@ -41,7 +42,7 @@ app.MapGet("/healthz", (WhisperTranscriberOptions options) => Results.Ok(new
     service = "AIO.Transcription.Server",
     status = "ok",
     timeUtc = DateTimeOffset.UtcNow,
-    minimumWindowMilliseconds = options.MinimumWindowMilliseconds,
+    bufferWindowMilliseconds = options.BufferWindowMillisecondsResolved,
     modelType = options.ModelType,
     targetSampleRate = options.TargetSampleRate
 }));
@@ -70,12 +71,10 @@ app.Map("/ws/transcribe", async context =>
         Type = "server-ready",
         Message = "Connected. Send start-session first."
     }, context.RequestAborted);
-    logger.Trace("Sent server-ready envelope.");
-
     while (socket.State == WebSocketState.Open && !context.RequestAborted.IsCancellationRequested)
     {
-        var message = await ReceiveMessageAsync(socket, buffer, context.RequestAborted);
-        if (message is null)
+        var messageBytes = await ReceiveMessageAsync(socket, buffer, context.RequestAborted);
+        if (messageBytes is null)
         {
             logger.Info($"Client initiated websocket close. ActiveSessionId={currentSessionId}");
             break;
@@ -84,7 +83,7 @@ app.Map("/ws/transcribe", async context =>
         ClientEnvelope? clientEnvelope;
         try
         {
-            clientEnvelope = JsonSerializer.Deserialize<ClientEnvelope>(message, JsonOptions.Default);
+            clientEnvelope = JsonSerializer.Deserialize<ClientEnvelope>(messageBytes.Value.Span, JsonOptions.WebSocket);
         }
         catch (JsonException ex)
         {
@@ -107,8 +106,6 @@ app.Map("/ws/transcribe", async context =>
         }
 
         currentSessionId = string.IsNullOrWhiteSpace(clientEnvelope.SessionId) ? currentSessionId : clientEnvelope.SessionId;
-        logger.Debug(
-            $"Received client envelope. Type={clientEnvelope.Type} SessionId={currentSessionId} Sequence={clientEnvelope.Sequence} PayloadChars={message.Length}");
 
         try
         {
@@ -160,8 +157,6 @@ app.Map("/ws/transcribe", async context =>
                     }
 
                     var session = registry.GetOrCreate(currentSessionId);
-                    logger.Debug(
-                        $"Decoded audio chunk. SessionId={currentSessionId} Sequence={clientEnvelope.Sequence} AudioBytes={audioBytes.Length} Encoding={clientEnvelope.Encoding ?? "f32le"} SampleRate={clientEnvelope.SampleRate ?? 48000} Channels={clientEnvelope.Channels ?? 2}");
                     var update = await session.AddAudioChunkAsync(new AudioChunk(
                         audioBytes,
                         audioBytes.Length,
@@ -179,8 +174,6 @@ app.Map("/ws/transcribe", async context =>
                         ReceivedChunkCount = sessionSnapshot.ReceivedChunkCount,
                         ReceivedAudioBytes = sessionSnapshot.ReceivedAudioBytes,
                     }, context.RequestAborted);
-                    logger.Trace(
-                        $"Sent audio ack. SessionId={currentSessionId} Sequence={clientEnvelope.Sequence} ReceivedChunkCount={sessionSnapshot.ReceivedChunkCount} ReceivedAudioBytes={sessionSnapshot.ReceivedAudioBytes}");
 
                     if (update is not null)
                     {
@@ -277,9 +270,9 @@ app.Map("/ws/transcribe", async context =>
 
 await app.RunAsync();
 
-static async Task<string?> ReceiveMessageAsync(WebSocket socket, byte[] buffer, CancellationToken cancellationToken)
+static async Task<ReadOnlyMemory<byte>?> ReceiveMessageAsync(WebSocket socket, byte[] buffer, CancellationToken cancellationToken)
 {
-    using var stream = new MemoryStream();
+    var writer = new ArrayBufferWriter<byte>();
     while (true)
     {
         var result = await socket.ReceiveAsync(buffer, cancellationToken);
@@ -293,17 +286,19 @@ static async Task<string?> ReceiveMessageAsync(WebSocket socket, byte[] buffer, 
             return null;
         }
 
-        stream.Write(buffer, 0, result.Count);
+        var destination = writer.GetSpan(result.Count);
+        buffer.AsSpan(0, result.Count).CopyTo(destination);
+        writer.Advance(result.Count);
         if (result.EndOfMessage)
         {
-            return Encoding.UTF8.GetString(stream.ToArray());
+            return writer.WrittenMemory;
         }
     }
 }
 
 static async Task SendAsync(WebSocket socket, ServerEnvelope envelope, CancellationToken cancellationToken)
 {
-    var bytes = JsonSerializer.SerializeToUtf8Bytes(envelope, JsonOptions.Default);
+    var bytes = JsonSerializer.SerializeToUtf8Bytes(envelope, JsonOptions.WebSocket);
     await socket.SendAsync(bytes, WebSocketMessageType.Text, true, cancellationToken);
 }
 
@@ -397,7 +392,12 @@ static void WriteBootstrapTrace(string contentRootPath, string message)
 
 static class JsonOptions
 {
-    public static readonly JsonSerializerOptions Default = new(JsonSerializerDefaults.Web)
+    public static readonly JsonSerializerOptions WebSocket = new(JsonSerializerDefaults.Web)
+    {
+        WriteIndented = false
+    };
+
+    public static readonly JsonSerializerOptions Http = new(JsonSerializerDefaults.Web)
     {
         WriteIndented = true
     };

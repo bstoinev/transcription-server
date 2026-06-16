@@ -11,6 +11,7 @@
     <PackageReference Include="NLog" Version="6.1.1" />
     <PackageReference Include="Whisper.net" Version="1.9.1" />
     <PackageReference Include="Whisper.net.Runtime" Version="1.9.1" />
+    <PackageReference Include="Whisper.net.Runtime.Cuda.Windows" Version="1.9.1" />
   </ItemGroup>
   <ItemGroup>
     <None Update="NLog.config">

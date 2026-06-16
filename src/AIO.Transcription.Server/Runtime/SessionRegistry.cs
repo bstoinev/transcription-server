@@ -32,11 +32,6 @@ public sealed class SessionRegistry
                 sessions[sessionId] = session;
                 log.Info($"Created live transcription session. SessionId={sessionId} ActiveSessionCount={sessions.Count}");
             }
-            else
-            {
-                log.Trace($"Reused live transcription session. SessionId={sessionId} ActiveSessionCount={sessions.Count}");
-            }
-
             return session;
         }
     }
@@ -45,7 +40,6 @@ public sealed class SessionRegistry
     {
         lock (sync)
         {
-            log.Trace($"Enumerating active sessions. ActiveSessionCount={sessions.Count}");
             return sessions.Values.Select(x => x.CreateSnapshot()).OrderBy(x => x.SessionId, StringComparer.OrdinalIgnoreCase).ToArray();
         }
     }

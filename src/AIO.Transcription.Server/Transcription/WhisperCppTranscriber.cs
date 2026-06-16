@@ -31,9 +31,24 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         await modelLock.WaitAsync(cancellationToken);
         try
         {
-            log.Debug($"Starting whisper transcription. WaveBytes={waveBytes.Length}");
             var modelPath = await EnsureModelPathAsync(cancellationToken);
-            factory ??= WhisperFactory.FromPath(modelPath);
+            if (factory is null)
+            {
+                var factoryOptions = new WhisperFactoryOptions
+                {
+                    UseGpu = options.UseGpu,
+                    GpuDevice = options.GpuDevice,
+                    UseFlashAttention = options.UseFlashAttention
+                };
+
+                log.Info(
+                    $"Initializing whisper factory. ModelPath={modelPath} UseGpu={factoryOptions.UseGpu} GpuDevice={factoryOptions.GpuDevice} UseFlashAttention={factoryOptions.UseFlashAttention}");
+                factory = WhisperFactory.FromPath(modelPath, factoryOptions);
+                var runtimeInfo = WhisperFactory.GetRuntimeInfo() ?? string.Empty;
+                log.Info($"Whisper runtime info: {runtimeInfo}");
+                EnforceRuntimeExpectation(runtimeInfo);
+            }
+
             await using var processor = factory.CreateBuilder().WithLanguage("auto").Build();
             using var stream = new MemoryStream(waveBytes, writable: false);
             var transcript = new StringBuilder();
@@ -74,7 +89,6 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
     {
         if (!string.IsNullOrWhiteSpace(resolvedModelPath) && File.Exists(resolvedModelPath))
         {
-            log.Trace($"Using cached whisper model path. ModelPath={resolvedModelPath}");
             return resolvedModelPath;
         }
 
@@ -116,5 +130,39 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         resolvedModelPath = targetPath;
         log.Info($"Resolved whisper model path. ModelPath={resolvedModelPath}");
         return resolvedModelPath;
+    }
+
+    private void EnforceRuntimeExpectation(string runtimeInfo)
+    {
+        if (!options.UseGpu)
+        {
+            return;
+        }
+
+        if (options.AllowCpuFallback is null)
+        {
+            var message =
+                "GPU transcription is enabled, but Transcription:AllowCpuFallback is not configured. Set it explicitly to true or false.";
+            log.Error(message);
+            throw new InvalidOperationException(message);
+        }
+
+        if (runtimeInfo.Contains("CUDA", StringComparison.OrdinalIgnoreCase))
+        {
+            log.Info($"CUDA runtime selected successfully. RuntimeInfo={runtimeInfo}");
+            return;
+        }
+
+        if (options.AllowCpuFallback.Value)
+        {
+            log.Warn(
+                $"GPU was requested but CUDA runtime was not selected. Falling back to CPU because Transcription:AllowCpuFallback=true. RuntimeInfo={runtimeInfo}");
+            return;
+        }
+
+        var failureMessage =
+            $"GPU was requested but CUDA runtime was not selected, and Transcription:AllowCpuFallback=false. RuntimeInfo={runtimeInfo}";
+        log.Error(failureMessage);
+        throw new InvalidOperationException(failureMessage);
     }
 }
