@@ -30,6 +30,7 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
     private bool acceptingAudio = true;
     private bool flushPendingAudioOnCompletion;
     private Exception? processingFailure;
+    private bool failureReported;
 
     public LiveTranscriptionSession(string sessionId, IWaveTranscriber transcriber, WhisperTranscriberOptions options, ILogMachina<LiveTranscriptionSession> log)
     {
@@ -141,7 +142,13 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         {
             if (processingFailure is not null)
             {
-                throw new InvalidOperationException($"Session {SessionId} can no longer process audio.", processingFailure);
+                if (!failureReported)
+                {
+                    failureReported = true;
+                    throw new InvalidOperationException($"Session {SessionId} can no longer process audio.", processingFailure);
+                }
+
+                throw new InvalidOperationException($"Session {SessionId} can no longer process audio because transcription already failed.");
             }
 
             if (!acceptingAudio)

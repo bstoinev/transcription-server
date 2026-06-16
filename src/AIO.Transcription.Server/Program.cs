@@ -408,8 +408,19 @@ static async Task ForwardSessionUpdatesAsync(
 {
     await foreach (var update in session.ReadUpdatesAsync(cancellationToken))
     {
-        logger.Info(
-            $"Transcript update emitted. SessionId={update.SessionId} TranscriptChars={update.TranscriptText?.Length ?? 0} ReceivedChunkCount={update.ReceivedChunkCount ?? 0} IsFinal={update.IsFinal ?? false}");
+        if (string.Equals(update.Type, "transcript", StringComparison.OrdinalIgnoreCase))
+        {
+            logger.Info(
+                $"Transcript update emitted. SessionId={update.SessionId} TranscriptChars={update.TranscriptText?.Length ?? 0} ReceivedChunkCount={update.ReceivedChunkCount ?? 0} IsFinal={update.IsFinal ?? false}");
+        }
+        else if (string.Equals(update.Type, "error", StringComparison.OrdinalIgnoreCase))
+        {
+            logger.Error($"Session update emitted error. SessionId={update.SessionId} Message={update.Message}");
+        }
+        else
+        {
+            logger.Info($"Session update emitted. Type={update.Type} SessionId={update.SessionId}");
+        }
 
         if (!await trySendEnvelopeAsync(update, cancellationToken))
         {
