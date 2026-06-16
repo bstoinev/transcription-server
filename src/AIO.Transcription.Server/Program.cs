@@ -1,6 +1,5 @@
 using System.Buffers;
 using System.Net.WebSockets;
-using System.Text;
 using System.Text.Json;
 using AIO.Transcription.Server.Audio;
 using AIO.Transcription.Server.Contracts.Protocol;
@@ -61,12 +60,15 @@ app.Map("/ws/transcribe", async context =>
 
     var registry = context.RequestServices.GetRequiredService<SessionRegistry>();
     using var socket = await context.WebSockets.AcceptWebSocketAsync();
+    using var sendLock = new SemaphoreSlim(1, 1);
     var buffer = new byte[64 * 1024];
+    LiveTranscriptionSession? activeSession = null;
+    Task? updateForwardingTask = null;
     string currentSessionId = string.Empty;
     logger.Info(
         $"Accepted websocket connection. Remote={context.Connection.RemoteIpAddress}:{context.Connection.RemotePort} Local={context.Connection.LocalIpAddress}:{context.Connection.LocalPort}");
 
-    await SendAsync(socket, new ServerEnvelope
+    await TrySendEnvelopeAsync(new ServerEnvelope
     {
         Type = "server-ready",
         Message = "Connected. Send start-session first."
@@ -105,8 +107,6 @@ app.Map("/ws/transcribe", async context =>
             continue;
         }
 
-        currentSessionId = string.IsNullOrWhiteSpace(clientEnvelope.SessionId) ? currentSessionId : clientEnvelope.SessionId;
-
         try
         {
             switch (clientEnvelope.Type)
@@ -114,15 +114,39 @@ app.Map("/ws/transcribe", async context =>
                 case "start-session":
                     if (string.IsNullOrWhiteSpace(clientEnvelope.SessionId))
                     {
-                        await SendAsync(socket, new ServerEnvelope { Type = "error", Message = "sessionId is required for start-session." }, context.RequestAborted);
+                        await TrySendEnvelopeAsync(new ServerEnvelope { Type = "error", Message = "sessionId is required for start-session." }, context.RequestAborted);
                         continue;
                     }
 
-                    var started = registry.GetOrCreate(clientEnvelope.SessionId);
+                    if (activeSession is not null)
+                    {
+                        await TrySendEnvelopeAsync(new ServerEnvelope
+                        {
+                            Type = "error",
+                            SessionId = currentSessionId,
+                            Message = "A session is already active on this connection."
+                        }, context.RequestAborted);
+                        continue;
+                    }
+
+                    if (!registry.TryCreate(clientEnvelope.SessionId, out var started))
+                    {
+                        await TrySendEnvelopeAsync(new ServerEnvelope
+                        {
+                            Type = "error",
+                            SessionId = clientEnvelope.SessionId,
+                            Message = "A session with the same sessionId is already active."
+                        }, context.RequestAborted);
+                        continue;
+                    }
+
+                    activeSession = started;
+                    currentSessionId = started.SessionId;
+                    updateForwardingTask = ForwardSessionUpdatesAsync(started, TrySendEnvelopeAsync, logger, context.RequestAborted);
                     var startedSnapshot = started.CreateSnapshot();
                     logger.Info(
                         $"Session started. SessionId={started.SessionId} Encoding={clientEnvelope.Encoding ?? "<null>"} SampleRate={clientEnvelope.SampleRate?.ToString() ?? "<null>"} Channels={clientEnvelope.Channels?.ToString() ?? "<null>"}");
-                    await SendAsync(socket, new ServerEnvelope
+                    await TrySendEnvelopeAsync(new ServerEnvelope
                     {
                         Type = "session-started",
                         SessionId = started.SessionId,
@@ -133,15 +157,15 @@ app.Map("/ws/transcribe", async context =>
                     break;
 
                 case "audio-chunk":
-                    if (string.IsNullOrWhiteSpace(currentSessionId))
+                    if (activeSession is null || string.IsNullOrWhiteSpace(currentSessionId))
                     {
-                        await SendAsync(socket, new ServerEnvelope { Type = "error", Message = "No active session. Send start-session first." }, context.RequestAborted);
+                        await TrySendEnvelopeAsync(new ServerEnvelope { Type = "error", Message = "No active session. Send start-session first." }, context.RequestAborted);
                         continue;
                     }
 
                     if (string.IsNullOrWhiteSpace(clientEnvelope.AudioBase64))
                     {
-                        await SendAsync(socket, new ServerEnvelope { Type = "error", SessionId = currentSessionId, Message = "audioBase64 is required for audio-chunk." }, context.RequestAborted);
+                        await TrySendEnvelopeAsync(new ServerEnvelope { Type = "error", SessionId = currentSessionId, Message = "audioBase64 is required for audio-chunk." }, context.RequestAborted);
                         continue;
                     }
 
@@ -152,21 +176,32 @@ app.Map("/ws/transcribe", async context =>
                     }
                     catch (FormatException)
                     {
-                        await SendAsync(socket, new ServerEnvelope { Type = "error", SessionId = currentSessionId, Message = "audioBase64 is not valid base64." }, context.RequestAborted);
+                        await TrySendEnvelopeAsync(new ServerEnvelope { Type = "error", SessionId = currentSessionId, Message = "audioBase64 is not valid base64." }, context.RequestAborted);
                         continue;
                     }
 
-                    var session = registry.GetOrCreate(currentSessionId);
-                    var update = await session.AddAudioChunkAsync(new AudioChunk(
+                    if (!string.IsNullOrWhiteSpace(clientEnvelope.SessionId) &&
+                        !string.Equals(clientEnvelope.SessionId, currentSessionId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        await TrySendEnvelopeAsync(new ServerEnvelope
+                        {
+                            Type = "error",
+                            SessionId = currentSessionId,
+                            Message = "audio-chunk sessionId does not match the active session."
+                        }, context.RequestAborted);
+                        continue;
+                    }
+
+                    await activeSession.AddAudioChunkAsync(new AudioChunk(
                         audioBytes,
                         audioBytes.Length,
                         clientEnvelope.SampleRate ?? 48000,
                         clientEnvelope.Channels ?? 2,
                         clientEnvelope.Encoding ?? "f32le",
                         DateTimeOffset.UtcNow), context.RequestAborted);
-                    var sessionSnapshot = session.CreateSnapshot();
+                    var sessionSnapshot = activeSession.CreateSnapshot();
 
-                    await SendAsync(socket, new ServerEnvelope
+                    await TrySendEnvelopeAsync(new ServerEnvelope
                     {
                         Type = "audio-ack",
                         SessionId = currentSessionId,
@@ -174,25 +209,29 @@ app.Map("/ws/transcribe", async context =>
                         ReceivedChunkCount = sessionSnapshot.ReceivedChunkCount,
                         ReceivedAudioBytes = sessionSnapshot.ReceivedAudioBytes,
                     }, context.RequestAborted);
-
-                    if (update is not null)
-                    {
-                        logger.Info(
-                            $"Transcript update emitted. SessionId={currentSessionId} TranscriptChars={update.TranscriptText?.Length ?? 0} ReceivedChunkCount={update.ReceivedChunkCount ?? 0}");
-                        await SendAsync(socket, update, context.RequestAborted);
-                    }
                     break;
 
                 case "simulate-text":
-                    if (string.IsNullOrWhiteSpace(currentSessionId))
+                    if (activeSession is null || string.IsNullOrWhiteSpace(currentSessionId))
                     {
-                        await SendAsync(socket, new ServerEnvelope { Type = "error", Message = "No active session. Send start-session first." }, context.RequestAborted);
+                        await TrySendEnvelopeAsync(new ServerEnvelope { Type = "error", Message = "No active session. Send start-session first." }, context.RequestAborted);
                         continue;
                     }
 
-                    registry.GetOrCreate(currentSessionId);
+                    if (!string.IsNullOrWhiteSpace(clientEnvelope.SessionId) &&
+                        !string.Equals(clientEnvelope.SessionId, currentSessionId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        await TrySendEnvelopeAsync(new ServerEnvelope
+                        {
+                            Type = "error",
+                            SessionId = currentSessionId,
+                            Message = "simulate-text sessionId does not match the active session."
+                        }, context.RequestAborted);
+                        continue;
+                    }
+
                     logger.Warn($"Simulated transcript requested. SessionId={currentSessionId} IsFinal={clientEnvelope.IsFinalChunk ?? true}");
-                    await SendAsync(socket, new ServerEnvelope
+                    await TrySendEnvelopeAsync(new ServerEnvelope
                     {
                         Type = "transcript",
                         SessionId = currentSessionId,
@@ -203,25 +242,50 @@ app.Map("/ws/transcribe", async context =>
                     break;
 
                 case "end-session":
-                    if (string.IsNullOrWhiteSpace(currentSessionId))
+                    if (activeSession is null || string.IsNullOrWhiteSpace(currentSessionId))
                     {
-                        await SendAsync(socket, new ServerEnvelope { Type = "error", Message = "No active session to end." }, context.RequestAborted);
+                        await TrySendEnvelopeAsync(new ServerEnvelope { Type = "error", Message = "No active session to end." }, context.RequestAborted);
                         continue;
                     }
 
+                    if (!string.IsNullOrWhiteSpace(clientEnvelope.SessionId) &&
+                        !string.Equals(clientEnvelope.SessionId, currentSessionId, StringComparison.OrdinalIgnoreCase))
+                    {
+                        await TrySendEnvelopeAsync(new ServerEnvelope
+                        {
+                            Type = "error",
+                            SessionId = currentSessionId,
+                            Message = "end-session sessionId does not match the active session."
+                        }, context.RequestAborted);
+                        continue;
+                    }
+
+                    await activeSession.CompleteAsync(flushPendingAudio: true, context.RequestAborted);
+                    if (updateForwardingTask is not null)
+                    {
+                        await updateForwardingTask;
+                    }
+
                     var removed = registry.Remove(currentSessionId);
+                    if (removed is not null)
+                    {
+                        await removed.DisposeAsync();
+                    }
+
                     var removedSnapshot = removed?.CreateSnapshot();
                     logger.Info(
                         $"Session ended by client. SessionId={currentSessionId} Removed={removed is not null} ReceivedChunkCount={removedSnapshot?.ReceivedChunkCount ?? 0} ReceivedAudioBytes={removedSnapshot?.ReceivedAudioBytes ?? 0}");
-                    await SendAsync(socket,
+                    await TrySendEnvelopeAsync(
                         removed?.BuildEndedEnvelope() ?? new ServerEnvelope { Type = "session-ended", SessionId = currentSessionId, Message = "Session ended." },
                         context.RequestAborted);
+                    activeSession = null;
+                    updateForwardingTask = null;
                     currentSessionId = string.Empty;
                     break;
 
                 default:
                     logger.Warn($"Unsupported client envelope type. Type={clientEnvelope.Type} SessionId={currentSessionId}");
-                    await SendAsync(socket, new ServerEnvelope
+                    await TrySendEnvelopeAsync(new ServerEnvelope
                     {
                         Type = "error",
                         SessionId = currentSessionId,
@@ -243,7 +307,7 @@ app.Map("/ws/transcribe", async context =>
 
             if (socket.State == WebSocketState.Open)
             {
-                await SendAsync(socket, new ServerEnvelope
+                await TrySendEnvelopeAsync(new ServerEnvelope
                 {
                     Type = "error",
                     SessionId = currentSessionId,
@@ -263,9 +327,43 @@ app.Map("/ws/transcribe", async context =>
         var removedSnapshot = removed?.CreateSnapshot();
         logger.Warn(
             $"WebSocket handler exited with an active session. SessionId={currentSessionId} Removed={removed is not null} ReceivedChunkCount={removedSnapshot?.ReceivedChunkCount ?? 0} ReceivedAudioBytes={removedSnapshot?.ReceivedAudioBytes ?? 0}");
+        if (removed is not null)
+        {
+            await removed.DisposeAsync();
+        }
+    }
+
+    if (updateForwardingTask is not null)
+    {
+        try
+        {
+            await updateForwardingTask;
+        }
+        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+        {
+        }
     }
 
     logger.Info($"WebSocket handler completed. FinalSocketState={socket.State} FinalSessionId={currentSessionId}");
+
+    async Task<bool> TrySendEnvelopeAsync(ServerEnvelope envelope, CancellationToken cancellationToken)
+    {
+        await sendLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (socket.State != WebSocketState.Open)
+            {
+                return false;
+            }
+
+            await SendAsync(socket, envelope, cancellationToken);
+            return true;
+        }
+        finally
+        {
+            sendLock.Release();
+        }
+    }
 });
 
 await app.RunAsync();
@@ -300,6 +398,25 @@ static async Task SendAsync(WebSocket socket, ServerEnvelope envelope, Cancellat
 {
     var bytes = JsonSerializer.SerializeToUtf8Bytes(envelope, JsonOptions.WebSocket);
     await socket.SendAsync(bytes, WebSocketMessageType.Text, true, cancellationToken);
+}
+
+static async Task ForwardSessionUpdatesAsync(
+    LiveTranscriptionSession session,
+    Func<ServerEnvelope, CancellationToken, Task<bool>> trySendEnvelopeAsync,
+    ILogMachina<TranscriptionWebSocketEndpoint> logger,
+    CancellationToken cancellationToken)
+{
+    await foreach (var update in session.ReadUpdatesAsync(cancellationToken))
+    {
+        logger.Info(
+            $"Transcript update emitted. SessionId={update.SessionId} TranscriptChars={update.TranscriptText?.Length ?? 0} ReceivedChunkCount={update.ReceivedChunkCount ?? 0} IsFinal={update.IsFinal ?? false}");
+
+        if (!await trySendEnvelopeAsync(update, cancellationToken))
+        {
+            logger.Warn($"Unable to send session update because the websocket is no longer open. SessionId={update.SessionId}");
+            break;
+        }
+    }
 }
 
 static void ConfigureNLog(IHostEnvironment environment)

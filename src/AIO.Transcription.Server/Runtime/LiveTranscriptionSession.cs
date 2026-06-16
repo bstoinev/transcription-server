@@ -1,3 +1,4 @@
+using System.Threading.Channels;
 using AIO.Transcription.Server.Audio;
 using AIO.Transcription.Server.Contracts.Protocol;
 using AIO.Transcription.Server.Logging;
@@ -6,15 +7,29 @@ using LogMachina;
 
 namespace AIO.Transcription.Server.Runtime;
 
-public sealed class LiveTranscriptionSession
+public sealed class LiveTranscriptionSession : IAsyncDisposable
 {
     private readonly object sync = new();
-    private readonly List<AudioChunk> pendingChunks = [];
+    private readonly Channel<AudioChunk> inputChannel = Channel.CreateUnbounded<AudioChunk>(new UnboundedChannelOptions
+    {
+        SingleReader = true,
+        SingleWriter = false
+    });
+    private readonly Channel<ServerEnvelope> updatesChannel = Channel.CreateUnbounded<ServerEnvelope>(new UnboundedChannelOptions
+    {
+        SingleReader = false,
+        SingleWriter = true
+    });
+    private readonly CancellationTokenSource lifetimeCts = new();
     private readonly IWaveTranscriber transcriber;
     private readonly WhisperTranscriberOptions options;
     private readonly ILogMachina<LiveTranscriptionSession> log;
     private readonly TranscriptionSessionSnapshot snapshot;
+    private readonly Task processingTask;
     private string lastTranscriptSegment = string.Empty;
+    private bool acceptingAudio = true;
+    private bool flushPendingAudioOnCompletion;
+    private Exception? processingFailure;
 
     public LiveTranscriptionSession(string sessionId, IWaveTranscriber transcriber, WhisperTranscriberOptions options, ILogMachina<LiveTranscriptionSession> log)
     {
@@ -28,15 +43,19 @@ public sealed class LiveTranscriptionSession
             ConnectedAtUtc = DateTimeOffset.UtcNow,
             UpdatedAtUtc = DateTimeOffset.UtcNow,
         };
+        processingTask = ProcessChunksAsync();
         this.log.Info($"Initialized live transcription session. SessionId={sessionId}");
     }
 
     public string SessionId { get; }
 
-    public async Task<ServerEnvelope?> AddAudioChunkAsync(AudioChunk chunk, CancellationToken cancellationToken)
+    public async Task AddAudioChunkAsync(AudioChunk chunk, CancellationToken cancellationToken)
     {
-        List<AudioChunk>? window = null;
-        TranscriptionSessionSnapshot? snapshotCopy = null;
+        ArgumentNullException.ThrowIfNull(chunk);
+
+        EnsureSessionIsAcceptingAudio();
+        await inputChannel.Writer.WriteAsync(chunk, cancellationToken);
+
         lock (sync)
         {
             if (snapshot.ReceivedChunkCount > 0 &&
@@ -48,61 +67,30 @@ public sealed class LiveTranscriptionSession
                     $"Audio format changed within active session. SessionId={SessionId} PreviousEncoding={snapshot.LastEncoding} PreviousSampleRate={snapshot.LastSampleRate} PreviousChannels={snapshot.LastChannels} NewEncoding={chunk.Encoding} NewSampleRate={chunk.SampleRate} NewChannels={chunk.Channels}");
             }
 
-            pendingChunks.Add(chunk);
             snapshot.UpdatedAtUtc = DateTimeOffset.UtcNow;
             snapshot.ReceivedChunkCount += 1;
             snapshot.ReceivedAudioBytes += chunk.BytesRecorded;
             snapshot.LastEncoding = chunk.Encoding;
             snapshot.LastSampleRate = chunk.SampleRate;
             snapshot.LastChannels = chunk.Channels;
-
-            var pendingMs = pendingChunks.Sum(WavePcm16Writer.EstimateChunkMilliseconds);
-            if (pendingMs >= options.BufferWindowMillisecondsResolved)
-            {
-                window = [.. pendingChunks];
-                pendingChunks.Clear();
-                log.Info(
-                    $"Transcription window reached. SessionId={SessionId} WindowChunkCount={window.Count} PendingMilliseconds={pendingMs:F2} BufferWindowMilliseconds={options.BufferWindowMillisecondsResolved} TargetSampleRate={options.TargetSampleRate}");
-            }
-
-            snapshotCopy = CloneSnapshot(snapshot);
         }
+    }
 
-        if (window is null)
-        {
-            return null;
-        }
+    public IAsyncEnumerable<ServerEnvelope> ReadUpdatesAsync(CancellationToken cancellationToken)
+    {
+        return updatesChannel.Reader.ReadAllAsync(cancellationToken);
+    }
 
-        var waveBytes = WavePcm16Writer.WriteWaveFile(window, options.TargetSampleRate);
-        var text = (await transcriber.TranscribeWaveAsync(waveBytes, cancellationToken)).Trim();
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return null;
-        }
-
+    public async Task CompleteAsync(bool flushPendingAudio, CancellationToken cancellationToken)
+    {
         lock (sync)
         {
-            if (string.Equals(lastTranscriptSegment, text, StringComparison.OrdinalIgnoreCase))
-            {
-                log.Trace($"Skipping duplicate transcript segment. SessionId={SessionId}");
-                return null;
-            }
-
-            lastTranscriptSegment = text;
+            flushPendingAudioOnCompletion |= flushPendingAudio;
+            acceptingAudio = false;
         }
 
-        log.Info($"Transcript segment updated. SessionId={SessionId} TranscriptChars={text.Length}");
-
-        return new ServerEnvelope
-        {
-            Type = "transcript",
-            SessionId = SessionId,
-            Message = "Transcript updated.",
-            TranscriptText = text,
-            IsFinal = false,
-            ReceivedChunkCount = snapshotCopy?.ReceivedChunkCount,
-            ReceivedAudioBytes = snapshotCopy?.ReceivedAudioBytes,
-        };
+        inputChannel.Writer.TryComplete();
+        await processingTask.WaitAsync(cancellationToken);
     }
 
     public ServerEnvelope BuildEndedEnvelope()
@@ -123,6 +111,143 @@ public sealed class LiveTranscriptionSession
         lock (sync)
         {
             return CloneSnapshot(snapshot);
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        lock (sync)
+        {
+            acceptingAudio = false;
+        }
+
+        lifetimeCts.Cancel();
+        inputChannel.Writer.TryComplete();
+
+        try
+        {
+            await processingTask;
+        }
+        catch (OperationCanceledException) when (lifetimeCts.IsCancellationRequested)
+        {
+        }
+
+        lifetimeCts.Dispose();
+    }
+
+    private void EnsureSessionIsAcceptingAudio()
+    {
+        lock (sync)
+        {
+            if (processingFailure is not null)
+            {
+                throw new InvalidOperationException($"Session {SessionId} can no longer process audio.", processingFailure);
+            }
+
+            if (!acceptingAudio)
+            {
+                throw new InvalidOperationException($"Session {SessionId} is no longer accepting audio.");
+            }
+        }
+    }
+
+    private async Task ProcessChunksAsync()
+    {
+        var pendingChunks = new List<AudioChunk>();
+        var pendingMilliseconds = 0.0;
+
+        try
+        {
+            await foreach (var chunk in inputChannel.Reader.ReadAllAsync(lifetimeCts.Token))
+            {
+                pendingChunks.Add(chunk);
+                pendingMilliseconds += WavePcm16Writer.EstimateChunkMilliseconds(chunk);
+
+                if (pendingMilliseconds < options.BufferWindowMillisecondsResolved)
+                {
+                    continue;
+                }
+
+                await ProcessWindowAsync(pendingChunks, pendingMilliseconds, isFinal: false, lifetimeCts.Token);
+                pendingChunks.Clear();
+                pendingMilliseconds = 0.0;
+            }
+
+            if (pendingChunks.Count > 0 && ShouldFlushPendingAudio())
+            {
+                await ProcessWindowAsync(pendingChunks, pendingMilliseconds, isFinal: true, lifetimeCts.Token);
+            }
+            else if (pendingChunks.Count > 0)
+            {
+                log.Info(
+                    $"Discarded trailing buffered audio during session shutdown. SessionId={SessionId} PendingChunkCount={pendingChunks.Count} PendingMilliseconds={pendingMilliseconds:F2}");
+            }
+        }
+        catch (OperationCanceledException) when (lifetimeCts.IsCancellationRequested)
+        {
+            log.Info($"Stopped background transcription processing. SessionId={SessionId}");
+        }
+        catch (Exception ex)
+        {
+            lock (sync)
+            {
+                processingFailure = ex;
+                acceptingAudio = false;
+            }
+
+            log.Error($"Background transcription processing failed. SessionId={SessionId}", ex);
+            updatesChannel.Writer.TryWrite(new ServerEnvelope
+            {
+                Type = "error",
+                SessionId = SessionId,
+                Message = $"Session transcription failed: {ex.Message}"
+            });
+        }
+        finally
+        {
+            updatesChannel.Writer.TryComplete();
+        }
+    }
+
+    private async Task ProcessWindowAsync(List<AudioChunk> pendingChunks, double pendingMilliseconds, bool isFinal, CancellationToken cancellationToken)
+    {
+        var window = pendingChunks.ToArray();
+        log.Info(
+            $"Transcription window reached. SessionId={SessionId} WindowChunkCount={window.Length} PendingMilliseconds={pendingMilliseconds:F2} BufferWindowMilliseconds={options.BufferWindowMillisecondsResolved} TargetSampleRate={options.TargetSampleRate} IsFinal={isFinal}");
+
+        var waveBytes = WavePcm16Writer.WriteWaveFile(window, options.TargetSampleRate);
+        var text = (await transcriber.TranscribeWaveAsync(waveBytes, cancellationToken)).Trim();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        if (string.Equals(lastTranscriptSegment, text, StringComparison.OrdinalIgnoreCase))
+        {
+            log.Trace($"Skipping duplicate transcript segment. SessionId={SessionId}");
+            return;
+        }
+
+        lastTranscriptSegment = text;
+        log.Info($"Transcript segment updated. SessionId={SessionId} TranscriptChars={text.Length} IsFinal={isFinal}");
+
+        updatesChannel.Writer.TryWrite(new ServerEnvelope
+        {
+            Type = "transcript",
+            SessionId = SessionId,
+            Message = "Transcript updated.",
+            TranscriptText = text,
+            IsFinal = isFinal,
+            ReceivedChunkCount = CreateSnapshot().ReceivedChunkCount,
+            ReceivedAudioBytes = CreateSnapshot().ReceivedAudioBytes,
+        });
+    }
+
+    private bool ShouldFlushPendingAudio()
+    {
+        lock (sync)
+        {
+            return flushPendingAudioOnCompletion;
         }
     }
 

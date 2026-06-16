@@ -22,17 +22,28 @@ public sealed class SessionRegistry
         this.log = log;
     }
 
-    public LiveTranscriptionSession GetOrCreate(string sessionId)
+    public bool TryCreate(string sessionId, out LiveTranscriptionSession session)
     {
         lock (sync)
         {
-            if (!sessions.TryGetValue(sessionId, out var session))
+            if (sessions.TryGetValue(sessionId, out session!))
             {
-                session = new LiveTranscriptionSession(sessionId, transcriber, options, logFactory.Create<LiveTranscriptionSession>());
-                sessions[sessionId] = session;
-                log.Info($"Created live transcription session. SessionId={sessionId} ActiveSessionCount={sessions.Count}");
+                log.Warn($"Rejected duplicate live transcription session creation. SessionId={sessionId} ActiveSessionCount={sessions.Count}");
+                return false;
             }
-            return session;
+
+            session = new LiveTranscriptionSession(sessionId, transcriber, options, logFactory.Create<LiveTranscriptionSession>());
+            sessions[sessionId] = session;
+            log.Info($"Created live transcription session. SessionId={sessionId} ActiveSessionCount={sessions.Count}");
+            return true;
+        }
+    }
+
+    public bool TryGet(string sessionId, out LiveTranscriptionSession session)
+    {
+        lock (sync)
+        {
+            return sessions.TryGetValue(sessionId, out session!);
         }
     }
 
