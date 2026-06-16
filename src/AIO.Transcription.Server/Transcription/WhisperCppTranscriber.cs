@@ -18,9 +18,7 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
     {
         this.options = options;
         this.log = log;
-    }
-
-    public async Task WarmUpAsync(CancellationToken cancellationToken)
+    }    public async Task WarmUpAsync(CancellationToken cancellationToken)
     {
         _ = await GetFactoryAsync(cancellationToken);
     }
@@ -111,7 +109,7 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         var ggmlType = Enum.TryParse<GgmlType>(options.ModelType, true, out var parsed)
             ? parsed
             : GgmlType.TinyEn;
-        var extension = ggmlType.ToString().ToLowerInvariant().Replace('_', '-');
+        var extension = GetModelFileStem(ggmlType);
         var targetPath = Path.Combine(modelDirectory, $"ggml-{extension}.bin");
         if (!File.Exists(targetPath))
         {
@@ -127,6 +125,22 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         resolvedModelPath = targetPath;
         log.Info($"Resolved whisper model path. ModelPath={resolvedModelPath}");
         return resolvedModelPath;
+    }
+
+    private static string GetModelFileStem(GgmlType ggmlType)
+    {
+        return ggmlType switch
+        {
+            GgmlType.TinyEn => "tiny.en",
+            GgmlType.BaseEn => "base.en",
+            GgmlType.SmallEn => "small.en",
+            GgmlType.MediumEn => "medium.en",
+            GgmlType.LargeV1 => "large-v1",
+            GgmlType.LargeV2 => "large-v2",
+            GgmlType.LargeV3 => "large-v3",
+            GgmlType.LargeV3Turbo => "large-v3-turbo",
+            _ => ggmlType.ToString().ToLowerInvariant().Replace('_', '-')
+        };
     }
 
     private async Task<WhisperFactory> GetFactoryAsync(CancellationToken cancellationToken)
