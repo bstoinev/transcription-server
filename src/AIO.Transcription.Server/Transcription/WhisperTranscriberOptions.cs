@@ -15,7 +15,6 @@ public sealed class WhisperTranscriberOptions
     public bool? AllowCpuFallback { get; set; }
     public int GpuDevice { get; set; }
     public bool UseFlashAttention { get; set; }
-    public bool WarmupOnStartup { get; set; } = true;
     public string? Language { get; set; } = "en";
     public bool EnableLanguageDetection { get; set; }
     public int PromptContextCharacters { get; set; } = DefaultPromptContextCharacters;

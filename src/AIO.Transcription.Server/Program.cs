@@ -29,7 +29,6 @@ builder.Services.AddSingleton(whisperOptions);
 builder.Services.AddLogMachina(x => x.WithNLog(ServiceLifetime.Singleton));
 builder.Services.AddHostedService<LoggingLifecycleHostedService>();
 builder.Services.AddSingleton<IWaveTranscriber, WhisperCppTranscriber>();
-builder.Services.AddHostedService<TranscriptionWarmupHostedService>();
 builder.Services.AddSingleton<SessionRegistry>();
 
 var app = builder.Build();

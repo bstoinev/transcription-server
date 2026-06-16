@@ -20,11 +20,6 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         this.log = log;
     }
 
-    public async Task WarmUpAsync(CancellationToken cancellationToken)
-    {
-        _ = await GetFactoryAsync(cancellationToken);
-    }
-
     public async Task<string> TranscribeWaveAsync(WaveTranscriptionRequest request, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -89,30 +84,18 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
             return resolvedModelPath;
         }
 
-        if (!string.IsNullOrWhiteSpace(options.ModelPath))
-        {
-            if (!File.Exists(options.ModelPath))
-            {
-                throw new FileNotFoundException($"Whisper model was not found at {options.ModelPath}");
-            }
-
-            resolvedModelPath = options.ModelPath;
-            log.Info($"Using configured whisper model path. ModelPath={resolvedModelPath}");
-            return resolvedModelPath;
-        }
-
-        if (!options.AutoDownloadModel)
-        {
-            throw new InvalidOperationException("No whisper model path was configured and auto-download is disabled.");
-        }
-
-        var modelDirectory = Path.Combine(AppContext.BaseDirectory, "models");
+        var modelDirectory = ResolveModelDirectory();
         Directory.CreateDirectory(modelDirectory);
-        var ggmlType = ParseModelType(options.ModelType);
-        var extension = GetModelFileStem(ggmlType);
-        var targetPath = Path.Combine(modelDirectory, $"ggml-{extension}.bin");
+        var (ggmlType, modelStem) = ResolveModelDefinition(options.ModelType);
+        var targetPath = ResolveConfiguredModelPath(modelDirectory, modelStem);
         if (!File.Exists(targetPath))
         {
+            if (!options.AutoDownloadModel)
+            {
+                throw new FileNotFoundException(
+                    $"Whisper model was not found at {targetPath}, and auto-download is disabled.");
+            }
+
             log.Info($"Downloading whisper model. ModelType={ggmlType} TargetPath={targetPath}");
             await using var modelStream = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(
                 ggmlType,
@@ -127,36 +110,90 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         return resolvedModelPath;
     }
 
-    private static GgmlType ParseModelType(string? modelType)
+    private string ResolveModelDirectory()
+    {
+        if (string.IsNullOrWhiteSpace(options.ModelPath))
+        {
+            return Path.Combine(AppContext.BaseDirectory, "models");
+        }
+
+        var configuredPath = options.ModelPath.Trim();
+        if (Directory.Exists(configuredPath))
+        {
+            return configuredPath;
+        }
+
+        if (File.Exists(configuredPath))
+        {
+            return Path.GetDirectoryName(configuredPath)
+                ?? throw new InvalidOperationException($"Whisper model path '{configuredPath}' does not have a valid parent directory.");
+        }
+
+        if (Path.HasExtension(configuredPath))
+        {
+            var parentDirectory = Path.GetDirectoryName(configuredPath);
+            if (string.IsNullOrWhiteSpace(parentDirectory))
+            {
+                throw new FileNotFoundException($"Whisper model was not found at {configuredPath}");
+            }
+
+            Directory.CreateDirectory(parentDirectory);
+            return parentDirectory;
+        }
+
+        Directory.CreateDirectory(configuredPath);
+        return configuredPath;
+    }
+
+    private string ResolveConfiguredModelPath(string modelDirectory, string modelStem)
+    {
+        if (!string.IsNullOrWhiteSpace(options.ModelPath))
+        {
+            var configuredPath = options.ModelPath.Trim();
+            if (File.Exists(configuredPath))
+            {
+                return configuredPath;
+            }
+
+            if (Path.HasExtension(configuredPath))
+            {
+                return configuredPath;
+            }
+        }
+
+        return Path.Combine(modelDirectory, $"ggml-{modelStem}.bin");
+    }
+
+    private static (GgmlType GgmlType, string FileStem) ResolveModelDefinition(string? modelType)
     {
         if (string.IsNullOrWhiteSpace(modelType))
         {
-            return GgmlType.BaseEn;
+            return (GgmlType.BaseEn, "base.en");
         }
 
         var normalized = modelType.Trim();
         if (Enum.TryParse<GgmlType>(normalized, true, out var enumParsed))
         {
-            return enumParsed;
+            return (enumParsed, GetModelFileStem(enumParsed));
         }
 
         normalized = normalized.ToLowerInvariant().Replace('_', '-');
         return normalized switch
         {
-            "tiny.en" => GgmlType.TinyEn,
-            "base.en" => GgmlType.BaseEn,
-            "small.en" => GgmlType.SmallEn,
-            "medium.en" => GgmlType.MediumEn,
-            "tiny" => GgmlType.Tiny,
-            "base" => GgmlType.Base,
-            "small" => GgmlType.Small,
-            "medium" => GgmlType.Medium,
-            "large-v1" => GgmlType.LargeV1,
-            "large-v2" => GgmlType.LargeV2,
-            "large-v3" => GgmlType.LargeV3,
-            "large-v3-turbo" => GgmlType.LargeV3Turbo,
+            "tiny.en" => (GgmlType.TinyEn, "tiny.en"),
+            "base.en" => (GgmlType.BaseEn, "base.en"),
+            "small.en" => (GgmlType.SmallEn, "small.en"),
+            "medium.en" => (GgmlType.MediumEn, "medium.en"),
+            "tiny" => (GgmlType.Tiny, "tiny"),
+            "base" => (GgmlType.Base, "base"),
+            "small" => (GgmlType.Small, "small"),
+            "medium" => (GgmlType.Medium, "medium"),
+            "large-v1" => (GgmlType.LargeV1, "large-v1"),
+            "large-v2" => (GgmlType.LargeV2, "large-v2"),
+            "large-v3" => (GgmlType.LargeV3, "large-v3"),
+            "large-v3-turbo" => (GgmlType.LargeV3Turbo, "large-v3-turbo"),
             _ => throw new InvalidOperationException(
-                $"Unsupported Transcription:ModelType '{modelType}'. Use whisper.cpp-style names such as 'base.en', 'medium.en', 'base', 'medium', 'large-v3', or 'large-v3-turbo'.")
+                $"Unsupported Transcription:ModelType '{modelType}'. Use the whisper.cpp stem that comes after 'ggml-' in the filename, such as 'base.en', 'medium.en', 'base', 'medium', 'large-v3', or 'large-v3-turbo'.")
         };
     }
 
