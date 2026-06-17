@@ -8,10 +8,10 @@ namespace AIO.Transcription.Server.Runtime;
 public sealed class SessionRegistry
 {
     private readonly Dictionary<string, LiveTranscriptionSession> sessions = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> provisioningSessionIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly ILogMachinaFactory logFactory;
     private readonly ILogMachina<SessionRegistry> log;
     private readonly object sync = new();
-    private string? provisioningSessionId;
 
     public SessionRegistry(ILogMachinaFactory logFactory, ILogMachina<SessionRegistry> log)
     {
@@ -28,26 +28,19 @@ public sealed class SessionRegistry
         {
             if (sessions.TryGetValue(sessionId, out _))
             {
-                var rejectionReason = "A session with the same sessionId is already active.";
-                log.Warn($"Rejected duplicate live transcription session creation. SessionId={sessionId} ActiveSessionCount={sessions.Count}");
+                var rejectionReason = "A live transcription session with the same sessionId already exists.";
+                log.Warn(
+                    $"Rejected live transcription session creation because the sessionId is already active. RequestedSessionId={sessionId} ActiveSessionCount={sessions.Count} ProvisioningSessionCount={provisioningSessionIds.Count}");
                 return SessionCreateResult.FromRejection(rejectionReason);
             }
 
-            if (string.Equals(provisioningSessionId, sessionId, StringComparison.OrdinalIgnoreCase))
+            if (!provisioningSessionIds.Add(sessionId))
             {
-                const string rejectionReason = "A session with the same sessionId is already being prepared.";
-                log.Warn($"Rejected duplicate provisioning request for live transcription session. SessionId={sessionId} ActiveSessionCount={sessions.Count}");
+                const string rejectionReason = "A live transcription session with the same sessionId is already being prepared.";
+                log.Warn(
+                    $"Rejected live transcription session creation because the sessionId is already provisioning. RequestedSessionId={sessionId} ActiveSessionCount={sessions.Count} ProvisioningSessionCount={provisioningSessionIds.Count}");
                 return SessionCreateResult.FromRejection(rejectionReason);
             }
-
-            if (sessions.Count > 0 || provisioningSessionId is not null)
-            {
-                var rejectionReason = "The server already has an active transcription session.";
-                log.Warn($"Rejected live transcription session creation because the server is already at capacity. SessionId={sessionId} ActiveSessionCount={sessions.Count} ProvisioningSessionId={provisioningSessionId ?? "<none>"}");
-                return SessionCreateResult.FromRejection(rejectionReason);
-            }
-
-            provisioningSessionId = sessionId;
         }
 
         WhisperCppTranscriber? transcriber = null;
@@ -61,8 +54,9 @@ public sealed class SessionRegistry
             lock (sync)
             {
                 sessions[sessionId] = session;
-                provisioningSessionId = null;
-                log.Info($"Created live transcription session. SessionId={sessionId} ModelType={options.ModelType} ActiveSessionCount={sessions.Count}");
+                provisioningSessionIds.Remove(sessionId);
+                log.Info(
+                    $"Created live transcription session using client-provided sessionId. SessionId={sessionId} ModelType={options.ModelType} ActiveSessionCount={sessions.Count} ProvisioningSessionCount={provisioningSessionIds.Count}");
             }
 
             transcriber = null;
@@ -72,10 +66,7 @@ public sealed class SessionRegistry
         {
             lock (sync)
             {
-                if (string.Equals(provisioningSessionId, sessionId, StringComparison.OrdinalIgnoreCase))
-                {
-                    provisioningSessionId = null;
-                }
+                provisioningSessionIds.Remove(sessionId);
             }
 
             transcriber?.Dispose();

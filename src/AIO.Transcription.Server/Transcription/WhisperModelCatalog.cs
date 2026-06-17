@@ -80,15 +80,8 @@ public static class WhisperModelCatalog
             sessionOptions.ModelType = effectiveConfiguredModelType;
         }
 
-        if (!string.IsNullOrWhiteSpace(requestedLanguage))
-        {
-            sessionOptions.Language = requestedLanguage.Trim();
-        }
-
-        if (requestedEnableLanguageDetection.HasValue)
-        {
-            sessionOptions.EnableLanguageDetection = requestedEnableLanguageDetection.Value;
-        }
+        sessionOptions.Language = string.IsNullOrWhiteSpace(baseOptions.Language) ? "en" : baseOptions.Language.Trim();
+        sessionOptions.EnableLanguageDetection = false;
 
         return sessionOptions;
     }

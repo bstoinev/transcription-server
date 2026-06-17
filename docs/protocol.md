@@ -1,30 +1,5 @@
-# AIO.Transcription.Server Protocol
+# Protocol Reference
 
-## WebSocket endpoint
+The live transcription websocket contract is documented in [live-transcription-contract.md](live-transcription-contract.md).
 
-`/ws/transcribe`
-
-## Message types
-
-### Client -> server
-- `start-session`
-- `audio-chunk`
-- `simulate-text`
-- `end-session`
-
-### Server -> client
-- `server-ready`
-- `session-started`
-- `audio-ack`
-- `transcript`
-- `session-ended`
-- `error`
-
-## Audio expectations
-
-Current default client path sends:
-- encoding: `f32le`
-- sampleRate: `48000`
-- channels: `2`
-
-Server-side transcription windowing converts those chunks to mono 16kHz PCM WAV before whisper transcription.
+Use that document as the only protocol reference when updating clients.

@@ -42,6 +42,34 @@ public static class WavePcm16Writer
         return BuildWaveFile(resampled, targetSampleRate);
     }
 
+    public static byte[] WriteWaveFile(IReadOnlyList<float> samples, int sampleRate)
+    {
+        ArgumentNullException.ThrowIfNull(samples);
+        if (sampleRate <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(sampleRate));
+        }
+
+        return BuildWaveFile(samples.ToArray(), sampleRate);
+    }
+
+    public static float[] DecodeMonoSamples(AudioChunk chunk, int targetSampleRate)
+    {
+        ArgumentNullException.ThrowIfNull(chunk);
+        if (targetSampleRate <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(targetSampleRate));
+        }
+
+        var sampleCount = GetFrameCount(chunk);
+        var samples = new float[sampleCount];
+        var written = ReadMonoSamples(chunk, samples);
+        var source = written == samples.Length ? samples : samples.AsSpan(0, written).ToArray();
+        return chunk.SampleRate == targetSampleRate
+            ? source
+            : Resample(source, chunk.SampleRate, targetSampleRate);
+    }
+
     public static double EstimateChunkMilliseconds(AudioChunk chunk)
     {
         var frames = GetFrameCount(chunk);

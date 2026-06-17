@@ -1,4 +1,4 @@
-
+﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.0.31903.59
@@ -9,13 +9,14 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AIO.Transcription.Server.Co
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AIO.Transcription.Server", "src\AIO.Transcription.Server\AIO.Transcription.Server.csproj", "{3945C1F8-16AA-42B2-8D16-07F70D283D5C}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{0AB3BF05-4346-4AA6-1389-037BE0695223}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AIO.Transcription.Server.Tests", "tests\AIO.Transcription.Server.Tests\AIO.Transcription.Server.Tests.csproj", "{E6D02D0A-8B53-415B-A0A5-C15CEC78CEFA}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
 		Release|Any CPU = Release|Any CPU
-	EndGlobalSection
-	GlobalSection(SolutionProperties) = preSolution
-		HideSolutionNode = FALSE
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
 		{5E0AA60A-E92C-426A-B3DF-A68E0922AF4D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
@@ -26,9 +27,17 @@ Global
 		{3945C1F8-16AA-42B2-8D16-07F70D283D5C}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{3945C1F8-16AA-42B2-8D16-07F70D283D5C}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{3945C1F8-16AA-42B2-8D16-07F70D283D5C}.Release|Any CPU.Build.0 = Release|Any CPU
+		{E6D02D0A-8B53-415B-A0A5-C15CEC78CEFA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E6D02D0A-8B53-415B-A0A5-C15CEC78CEFA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E6D02D0A-8B53-415B-A0A5-C15CEC78CEFA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E6D02D0A-8B53-415B-A0A5-C15CEC78CEFA}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{5E0AA60A-E92C-426A-B3DF-A68E0922AF4D} = {4B50A554-7B3A-48DF-A070-D819A2237858}
 		{3945C1F8-16AA-42B2-8D16-07F70D283D5C} = {4B50A554-7B3A-48DF-A070-D819A2237858}
+		{E6D02D0A-8B53-415B-A0A5-C15CEC78CEFA} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 	EndGlobalSection
 EndGlobal

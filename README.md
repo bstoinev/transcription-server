@@ -27,9 +27,10 @@ This repo now contains a real v2 server path:
 - ASP.NET Core service targeting `.NET 10`
 - WebSocket endpoint for incoming audio sessions
 - session registry
-- audio windowing
+- rolling live audio buffering
+- VAD-controlled utterance endpointing
 - whisper.cpp transcription through `Whisper.net`
-- transcript event emission
+- explicit partial/final transcript event emission
 - simulation path for downstream testing
 
 ## Architecture
@@ -49,7 +50,7 @@ flowchart LR
 
 ## Protocol shape
 
-### Client → server
+### Client -> server
 
 ```json
 {
@@ -82,17 +83,38 @@ flowchart LR
 }
 ```
 
-### Server → client
+`sessionId` is client-owned. The transcription server uses the provided value only as the live audio-session label and correlation ID. It does not interpret that ID as persisted interview state and does not implement restore or reopen behavior from it.
+
+Multiple live transcription sessions are allowed. A single websocket can carry more than one live session when client messages route work by `sessionId`. Raw binary audio frames remain valid only when exactly one live session is active on that websocket.
+
+### Server -> client
 
 ```json
 {
-  "type": "transcript",
+  "type": "partial-transcript",
   "sessionId": "demo-1",
-  "message": "Transcript updated.",
-  "transcriptText": "Can you explain the tradeoff here?",
-  "isFinal": false
+  "utteranceId": "demo-1-000001",
+  "sequence": 1,
+  "transcriptText": "can you explain the tradeoff",
+  "modelType": "base.en",
+  "receivedChunkCount": 4,
+  "receivedAudioBytes": 384000
 }
 ```
+
+```json
+{
+  "type": "final-transcript",
+  "sessionId": "demo-1",
+  "utteranceId": "demo-1-000001",
+  "transcriptText": "Can you explain the tradeoff here?",
+  "modelType": "base.en",
+  "receivedChunkCount": 8,
+  "receivedAudioBytes": 768000
+}
+```
+
+See [docs/live-transcription-contract.md](docs/live-transcription-contract.md) for the authoritative client contract.
 
 ## Solution layout
 
@@ -105,10 +127,11 @@ src/
 ## Design notes
 
 - Real STT wiring is present in source.
-- The current implementation transcribes when the pending audio window reaches the configured threshold.
+- Incoming audio chunks are transport units only; the server owns rolling partial windows and VAD-controlled final utterance boundaries.
 - `simulate-text` remains available to exercise clients before real machine deployment.
+- The same client `sessionId` can be shared with Hydra guidance, but persisted session restore semantics belong to Hydra, not to this transcription server.
+- JSON protocol messages are the preferred path for multiplexing multiple live sessions over one websocket because they carry `sessionId` explicitly.
 
 ## Status
 
-Server v2 flow is implemented in source.
-Local build verification is still blocked on this machine because `dotnet` is not installed here.
+Server v2 flow is implemented in source and builds locally with `dotnet build`.
