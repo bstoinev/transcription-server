@@ -588,9 +588,12 @@ static async Task<ReceivedSocketMessage?> ReceiveMessageAsync(WebSocket socket, 
         var result = await socket.ReceiveAsync(buffer, cancellationToken);
         if (result.MessageType == WebSocketMessageType.Close)
         {
-            if (socket.State == WebSocketState.Open)
+            if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
             {
-                await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", cancellationToken);
+                await socket.CloseAsync(
+                    result.CloseStatus ?? WebSocketCloseStatus.NormalClosure,
+                    result.CloseStatusDescription ?? "closing",
+                    cancellationToken);
             }
 
             return null;
