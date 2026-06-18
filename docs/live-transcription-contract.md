@@ -21,11 +21,16 @@ Start a live session:
 {
   "type": "start-session",
   "sessionId": "meeting-123",
+  "modelType": "medium.en",
+  "prompt": "Company names: Kaizen, Hydra. Domain: .NET, gRPC, Kafka.",
   "encoding": "f32le",
   "sampleRate": 48000,
   "channels": 2
 }
 ```
+
+`modelType` is required on `start-session` unless the server is pinned to a specific model file path.
+`prompt` is optional and is appended to the server-configured technical prompt for that live session.
 
 Send audio as JSON when multiplexing sessions:
 

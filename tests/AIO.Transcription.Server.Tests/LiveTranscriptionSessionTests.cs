@@ -164,6 +164,39 @@ public sealed class LiveTranscriptionSessionTests
         Assert.All(transcriber.Requests, x => Assert.Contains(options.TechnicalPrompt, x.Prompt ?? string.Empty));
     }
 
+    [Fact]
+    public void StartSessionRequiresModelTypeWhenServerIsNotPinned()
+    {
+        var options = CreateOptions();
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            WhisperModelCatalog.CreateSessionOptions(options, requestedModelType: null, requestedPrompt: null, requestedLanguage: null, requestedEnableLanguageDetection: null));
+        Assert.Contains("requires modelType", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void CapabilitiesDoNotAdvertiseDefaultModelWhenSessionMustChoose()
+    {
+        var capabilities = WhisperModelCatalog.BuildCapabilities(CreateOptions());
+        Assert.Equal(string.Empty, capabilities.DefaultModelType);
+        Assert.True(capabilities.SupportsSessionModelSelection);
+    }
+
+    [Fact]
+    public void SessionPromptIsAppendedToConfiguredTechnicalPrompt()
+    {
+        var options = CreateOptions();
+        options.TechnicalPrompt = "server prompt";
+
+        var sessionOptions = WhisperModelCatalog.CreateSessionOptions(
+            options,
+            requestedModelType: "medium.en",
+            requestedPrompt: "client prompt",
+            requestedLanguage: null,
+            requestedEnableLanguageDetection: null);
+
+        Assert.Equal("server prompt" + Environment.NewLine + "client prompt", sessionOptions.TechnicalPrompt);
+    }
+
     private static LiveTranscriptionSession CreateSession(RecordingTranscriber transcriber, WhisperTranscriberOptions? options = null)
     {
         options ??= CreateOptions();
@@ -179,6 +212,7 @@ public sealed class LiveTranscriptionSessionTests
     {
         return new WhisperTranscriberOptions
         {
+            ModelType = "medium.en",
             TargetSampleRate = 16000,
             PartialUpdateIntervalMs = 750,
             PartialWindowMs = 12000,

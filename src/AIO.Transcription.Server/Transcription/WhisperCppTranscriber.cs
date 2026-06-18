@@ -27,6 +27,12 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         log.Info($"Completed whisper warm-up. ModelType={options.ModelType}");
     }
 
+    public async Task<WhisperModelPreparationResult> PrepareModelAsync(CancellationToken cancellationToken)
+    {
+        var preparation = await EnsureModelPathAsync(cancellationToken);
+        return new WhisperModelPreparationResult(preparation.ModelPath, preparation.ModelType, preparation.DownloadedNow);
+    }
+
     public async Task<string> TranscribeWaveAsync(WaveTranscriptionRequest request, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -72,8 +78,7 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         }
 
         var result = transcript.ToString().Trim();
-        log.Info(
-            $"Completed whisper transcription. WaveBytes={request.WaveBytes.Length} TranscriptChars={result.Length} Language={request.Language ?? "<auto>"} PromptChars={request.Prompt?.Length ?? 0} DetectLanguage={request.EnableLanguageDetection}");
+        log.Debug($"Completed whisper transcription. WaveBytes={request.WaveBytes.Length} TranscriptChars={result.Length} Language={request.Language ?? "<auto>"} PromptChars={request.Prompt?.Length ?? 0} DetectLanguage={request.EnableLanguageDetection}");
         return result;
     }
 
@@ -84,17 +89,18 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         initializationLock.Dispose();
     }
 
-    private async Task<string> EnsureModelPathAsync(CancellationToken cancellationToken)
+    private async Task<ModelPathResolutionResult> EnsureModelPathAsync(CancellationToken cancellationToken)
     {
         if (!string.IsNullOrWhiteSpace(resolvedModelPath) && File.Exists(resolvedModelPath))
         {
-            return resolvedModelPath;
+            return new ModelPathResolutionResult(resolvedModelPath, WhisperModelCatalog.Resolve(options.ModelType).Id, DownloadedNow: false);
         }
 
         var modelDirectory = WhisperModelCatalog.ResolveModelDirectory(options);
         Directory.CreateDirectory(modelDirectory);
         var modelDefinition = WhisperModelCatalog.Resolve(options.ModelType);
         var targetPath = WhisperModelCatalog.ResolveModelPath(options, modelDefinition.Id);
+        var downloadedNow = false;
         if (!File.Exists(targetPath))
         {
             if (!options.AutoDownloadModel)
@@ -103,18 +109,19 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
                     $"Whisper model was not found at {targetPath}, and auto-download is disabled.");
             }
 
-            log.Info($"Downloading whisper model. ModelType={modelDefinition.Id} TargetPath={targetPath}");
+            log.Warn($"Whisper model was not found locally and will be downloaded. ModelType={modelDefinition.Id} TargetPath={targetPath}");
             await using var modelStream = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(
                 modelDefinition.GgmlType,
                 QuantizationType.NoQuantization,
                 cancellationToken);
             await using var fileStream = File.Create(targetPath);
             await modelStream.CopyToAsync(fileStream, cancellationToken);
+            downloadedNow = true;
         }
 
         resolvedModelPath = targetPath;
         log.Info($"Resolved whisper model path. ModelPath={resolvedModelPath}");
-        return resolvedModelPath;
+        return new ModelPathResolutionResult(resolvedModelPath, modelDefinition.Id, downloadedNow);
     }
 
     private async Task<WhisperFactory> GetFactoryAsync(CancellationToken cancellationToken)
@@ -141,8 +148,8 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
             };
 
             log.Info(
-                $"Initializing whisper factory. ModelPath={modelPath} UseGpu={factoryOptions.UseGpu} GpuDevice={factoryOptions.GpuDevice} UseFlashAttention={factoryOptions.UseFlashAttention}");
-            factory = WhisperFactory.FromPath(modelPath, factoryOptions);
+                $"Initializing whisper factory. ModelPath={modelPath.ModelPath} UseGpu={factoryOptions.UseGpu} GpuDevice={factoryOptions.GpuDevice} UseFlashAttention={factoryOptions.UseFlashAttention}");
+            factory = WhisperFactory.FromPath(modelPath.ModelPath, factoryOptions);
             var runtimeInfo = WhisperFactory.GetRuntimeInfo() ?? string.Empty;
             log.Info($"Whisper runtime info: {runtimeInfo}");
             EnforceRuntimeExpectation(runtimeInfo);
@@ -187,4 +194,8 @@ public sealed class WhisperCppTranscriber : IWaveTranscriber, IDisposable
         log.Error(failureMessage);
         throw new InvalidOperationException(failureMessage);
     }
+
+    private sealed record ModelPathResolutionResult(string ModelPath, string ModelType, bool DownloadedNow);
 }
+
+public sealed record WhisperModelPreparationResult(string ModelPath, string ModelType, bool DownloadedNow);

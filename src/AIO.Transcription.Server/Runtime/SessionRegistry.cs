@@ -47,6 +47,18 @@ public sealed class SessionRegistry
         try
         {
             transcriber = new WhisperCppTranscriber(options, logFactory.Create<WhisperCppTranscriber>());
+            var preparation = await transcriber.PrepareModelAsync(cancellationToken);
+            if (preparation.DownloadedNow)
+            {
+                var rejectionReason =
+                    $"Model '{preparation.ModelType}' was not present locally and has been downloaded to '{preparation.ModelPath}'. Start the session again once the download is complete.";
+                log.Warn(
+                    $"Deferred session creation after downloading missing model. SessionId={sessionId} ModelType={preparation.ModelType} ModelPath={preparation.ModelPath}");
+                transcriber.Dispose();
+                transcriber = null;
+                return SessionCreateResult.FromRejection(rejectionReason);
+            }
+
             await transcriber.WarmUpAsync(cancellationToken);
 
             var session = new LiveTranscriptionSession(sessionId, transcriber, options, logFactory.Create<LiveTranscriptionSession>());

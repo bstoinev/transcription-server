@@ -40,6 +40,8 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
     private int lastSpeechSampleExclusive;
     private int speechSampleCount;
     private int silenceSampleCount;
+    private int samplesSinceLastSpeech;
+    private double maxObservedRmsSinceLastSpeech;
     private bool utteranceActive;
     private bool acceptingAudio = true;
     private bool flushPendingAudioOnCompletion;
@@ -269,7 +271,10 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
 
     private async Task ProcessVadFrameAsync(CancellationToken cancellationToken)
     {
-        var frameIsSpeech = voiceActivityDetector.IsSpeech(CollectionsMarshal.AsSpan(vadFrameSamples));
+        var frameSamples = CollectionsMarshal.AsSpan(vadFrameSamples);
+        var frameRms = CalculateRms(frameSamples);
+        maxObservedRmsSinceLastSpeech = Math.Max(maxObservedRmsSinceLastSpeech, frameRms);
+        var frameIsSpeech = voiceActivityDetector.IsSpeech(frameSamples);
         if (frameIsSpeech)
         {
             if (!utteranceActive)
@@ -279,6 +284,8 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
 
             speechSampleCount += vadFrameSamples.Count;
             silenceSampleCount = 0;
+            samplesSinceLastSpeech = 0;
+            maxObservedRmsSinceLastSpeech = 0;
             lastSpeechSampleExclusive = utteranceSamples.Count;
         }
         else if (utteranceActive)
@@ -287,6 +294,17 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
             if (silenceSampleCount >= MillisecondsToSamples(options.EndSilenceMs))
             {
                 await FinalizeUtteranceAsync(force: false, cancellationToken);
+            }
+        }
+        else
+        {
+            samplesSinceLastSpeech += vadFrameSamples.Count;
+            if (samplesSinceLastSpeech >= MillisecondsToSamples(10000))
+            {
+                log.Warn(
+                    $"No speech detected yet for active session audio. SessionId={SessionId} ObservedMs={SamplesToMilliseconds(samplesSinceLastSpeech):F0} MaxObservedRms={maxObservedRmsSinceLastSpeech:F4} VadThreshold={options.VadEnergyThreshold:F4}");
+                samplesSinceLastSpeech = 0;
+                maxObservedRmsSinceLastSpeech = 0;
             }
         }
 
@@ -317,6 +335,8 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         }
 
         utteranceActive = true;
+        samplesSinceLastSpeech = 0;
+        maxObservedRmsSinceLastSpeech = 0;
         log.Info($"Started utterance. SessionId={SessionId} UtteranceId={currentUtteranceId} SeedSamples={seedSampleCount}");
     }
 
@@ -480,6 +500,22 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
     private double SamplesToMilliseconds(int samples)
     {
         return samples * 1000.0 / options.TargetSampleRate;
+    }
+
+    private static double CalculateRms(ReadOnlySpan<float> samples)
+    {
+        if (samples.Length == 0)
+        {
+            return 0;
+        }
+
+        var squareSum = 0.0;
+        for (var index = 0; index < samples.Length; index += 1)
+        {
+            squareSum += samples[index] * samples[index];
+        }
+
+        return Math.Sqrt(squareSum / samples.Length);
     }
 
     private bool ShouldFlushPendingAudio()

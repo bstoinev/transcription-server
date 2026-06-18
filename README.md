@@ -56,6 +56,8 @@ flowchart LR
 {
   "type": "start-session",
   "sessionId": "demo-1",
+  "modelType": "medium.en",
+  "prompt": "Names: Kaizen, Hydra. Stack: .NET, gRPC.",
   "encoding": "f32le",
   "sampleRate": 48000,
   "channels": 2

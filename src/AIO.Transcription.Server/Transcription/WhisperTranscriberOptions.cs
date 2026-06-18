@@ -6,7 +6,7 @@ public sealed class WhisperTranscriberOptions
 
     public string? ModelPath { get; set; }
     public bool AutoDownloadModel { get; set; } = true;
-    public string ModelType { get; set; } = "base.en";
+    public string? ModelType { get; set; }
     public int TargetSampleRate { get; set; } = 16000;
     public int PartialUpdateIntervalMs { get; set; } = 750;
     public int PartialWindowMs { get; set; } = 12000;
@@ -103,6 +103,11 @@ public sealed class WhisperTranscriberOptions
         if (string.IsNullOrWhiteSpace(Language))
         {
             Language = "en";
+        }
+
+        if (!string.IsNullOrWhiteSpace(ModelType))
+        {
+            ModelType = ModelType.Trim();
         }
     }
 }

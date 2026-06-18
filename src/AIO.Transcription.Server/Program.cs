@@ -46,7 +46,9 @@ app.MapGet("/healthz", (WhisperTranscriberOptions options) => Results.Ok(new
     minimumUtteranceMs = options.MinimumUtteranceMs,
     endSilenceMs = options.EndSilenceMs,
     maxUtteranceMs = options.MaxUtteranceMs,
-    modelType = WhisperModelCatalog.GetEffectiveConfiguredModelType(options),
+    modelType = WhisperModelCatalog.SupportsSessionModelSelection(options)
+        ? null
+        : WhisperModelCatalog.GetEffectiveConfiguredModelType(options),
     language = options.Language,
     targetSampleRate = options.TargetSampleRate
 }));
@@ -209,6 +211,7 @@ app.Map("/ws/transcribe", async context =>
                         sessionOptions = WhisperModelCatalog.CreateSessionOptions(
                             context.RequestServices.GetRequiredService<WhisperTranscriberOptions>(),
                             clientEnvelope.ModelType,
+                            clientEnvelope.Prompt,
                             clientEnvelope.Language,
                             clientEnvelope.EnableLanguageDetection);
                     }

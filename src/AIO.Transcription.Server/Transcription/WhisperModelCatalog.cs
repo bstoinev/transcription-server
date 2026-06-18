@@ -25,7 +25,9 @@ public static class WhisperModelCatalog
     {
         ArgumentNullException.ThrowIfNull(options);
 
-        var defaultModelType = GetEffectiveConfiguredModelType(options);
+        var defaultModelType = SupportsSessionModelSelection(options)
+            ? string.Empty
+            : GetEffectiveConfiguredModelType(options);
         var supportsSessionModelSelection = SupportsSessionModelSelection(options);
         var availableDefinitions = supportsSessionModelSelection
             ? Definitions
@@ -53,23 +55,30 @@ public static class WhisperModelCatalog
     public static WhisperTranscriberOptions CreateSessionOptions(
         WhisperTranscriberOptions baseOptions,
         string? requestedModelType,
+        string? requestedPrompt,
         string? requestedLanguage,
         bool? requestedEnableLanguageDetection)
     {
         ArgumentNullException.ThrowIfNull(baseOptions);
 
         var sessionOptions = baseOptions.Clone();
-        var effectiveConfiguredModelType = GetEffectiveConfiguredModelType(baseOptions);
         var normalizedRequestedModelType = string.IsNullOrWhiteSpace(requestedModelType)
             ? null
             : NormalizeModelType(requestedModelType);
 
         if (SupportsSessionModelSelection(baseOptions))
         {
-            sessionOptions.ModelType = normalizedRequestedModelType ?? effectiveConfiguredModelType;
+            if (normalizedRequestedModelType is null)
+            {
+                throw new InvalidOperationException(
+                    "start-session requires modelType when the server is not pinned to a specific model file.");
+            }
+
+            sessionOptions.ModelType = normalizedRequestedModelType;
         }
         else
         {
+            var effectiveConfiguredModelType = GetEffectiveConfiguredModelType(baseOptions);
             if (normalizedRequestedModelType is not null &&
                 !string.Equals(normalizedRequestedModelType, effectiveConfiguredModelType, StringComparison.OrdinalIgnoreCase))
             {
@@ -82,6 +91,7 @@ public static class WhisperModelCatalog
 
         sessionOptions.Language = string.IsNullOrWhiteSpace(baseOptions.Language) ? "en" : baseOptions.Language.Trim();
         sessionOptions.EnableLanguageDetection = false;
+        sessionOptions.TechnicalPrompt = CombinePrompt(baseOptions.TechnicalPrompt, requestedPrompt);
 
         return sessionOptions;
     }
@@ -90,7 +100,8 @@ public static class WhisperModelCatalog
     {
         if (string.IsNullOrWhiteSpace(modelType))
         {
-            return Definitions.First(x => string.Equals(x.Id, "base.en", StringComparison.OrdinalIgnoreCase));
+            throw new InvalidOperationException(
+                "A whisper model type is required. Expected values include 'base.en', 'medium.en', 'base', 'medium', or 'large-v3'.");
         }
 
         var normalized = modelType.Trim();
@@ -209,6 +220,15 @@ public static class WhisperModelCatalog
 
         var modelStem = fileName["ggml-".Length..^".bin".Length];
         return NormalizeModelType(modelStem);
+    }
+
+    private static string CombinePrompt(string? configuredPrompt, string? requestedPrompt)
+    {
+        var parts = new[] { configuredPrompt, requestedPrompt }
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x!.Trim())
+            .ToArray();
+        return parts.Length == 0 ? string.Empty : string.Join(Environment.NewLine, parts);
     }
 }
 

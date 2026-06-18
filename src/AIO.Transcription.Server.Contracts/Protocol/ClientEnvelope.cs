@@ -10,6 +10,7 @@ public sealed class ClientEnvelope
     public int? SampleRate { get; set; }
     public int? Channels { get; set; }
     public string? ModelType { get; set; }
+    public string? Prompt { get; set; }
     public string? Language { get; set; }
     public bool? EnableLanguageDetection { get; set; }
     public bool? IsFinalChunk { get; set; }
