@@ -4,6 +4,8 @@ This is the server-side websocket contract for live transcription clients.
 
 Endpoint: `WS /ws/transcribe`
 
+Diagnostics for omitted utterance investigations are documented in [live-transcription-diagnostics.md](live-transcription-diagnostics.md).
+
 ## Core Semantics
 
 - Incoming audio chunks are transport units only. A 500 ms chunk cadence is allowed, but 500 ms is not the recognition window.
@@ -130,6 +132,18 @@ Fields:
 - `VadFrameMs`: `20`
 - `VadEnergyThreshold`: `0.015`
 - `PromptContextCharacters`: `256`
+
+## Diagnostic Configuration
+
+- `EnableLiveDiagnostics`: `false`
+- `LogAudioChunkDiagnostics`: `false`
+- `LogVadFrameDiagnostics`: `false`
+- `LogUtteranceDiagnostics`: `true`
+- `SaveDebugUtteranceWavFiles`: `false`
+- `DebugUtteranceDirectory`: `"debug-audio"`
+- `SaveDroppedUtterances`: `true`
+- `SaveFinalizedUtterances`: `true`
+- `MaxDebugUtteranceFilesPerSession`: `100`
 
 ## Whisper And Prompt Context
 

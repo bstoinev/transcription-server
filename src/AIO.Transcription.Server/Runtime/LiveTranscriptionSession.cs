@@ -1,5 +1,8 @@
+using System.Diagnostics;
+using System.Globalization;
 using System.Threading.Channels;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using AIO.Transcription.Server.Audio;
 using AIO.Transcription.Server.Contracts.Protocol;
 using AIO.Transcription.Server.Logging;
@@ -42,11 +45,23 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
     private int silenceSampleCount;
     private int samplesSinceLastSpeech;
     private double maxObservedRmsSinceLastSpeech;
+    private double currentUtterancePeakRms;
     private bool utteranceActive;
     private bool acceptingAudio = true;
     private bool flushPendingAudioOnCompletion;
     private Exception? processingFailure;
     private bool failureReported;
+    private long totalNormalizedSampleCount;
+    private int utterancesStarted;
+    private int utterancesFinalized;
+    private int utterancesDropped;
+    private int partialTranscriptsRequested;
+    private int finalTranscriptsRequested;
+    private int finalTranscriptsEmitted;
+    private int debugUtteranceFilesWritten;
+    private bool sessionSummaryLogged;
+    private readonly Dictionary<string, int> dropCountsByReason = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<double> completedUtteranceDurationsMs = [];
 
     public LiveTranscriptionSession(
         string sessionId,
@@ -202,12 +217,13 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
             await foreach (var chunk in inputChannel.Reader.ReadAllAsync(lifetimeCts.Token))
             {
                 var samples = WavePcm16Writer.DecodeMonoSamples(chunk, options.TargetSampleRate);
-                await ProcessSamplesAsync(samples, lifetimeCts.Token);
+                var chunkContainedSpeechFrame = await ProcessSamplesAsync(samples, lifetimeCts.Token);
+                LogAudioChunkDiagnostics(chunk, samples, chunkContainedSpeechFrame);
             }
 
             if (utteranceActive && ShouldFlushPendingAudio())
             {
-                await FinalizeUtteranceAsync(force: true, lifetimeCts.Token);
+                await FinalizeUtteranceAsync("EndSessionFlush", lifetimeCts.Token);
             }
         }
         catch (OperationCanceledException) when (lifetimeCts.IsCancellationRequested)
@@ -232,18 +248,21 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         }
         finally
         {
+            LogSessionSummary();
             updatesChannel.Writer.TryComplete();
         }
     }
 
-    private async Task ProcessSamplesAsync(float[] samples, CancellationToken cancellationToken)
+    private async Task<bool> ProcessSamplesAsync(float[] samples, CancellationToken cancellationToken)
     {
         var vadFrameSampleCount = MillisecondsToSamples(options.VadFrameMs);
         var maxUtteranceSamples = MillisecondsToSamples(options.MaxUtteranceMs);
+        var chunkContainedSpeechFrame = false;
 
         foreach (var sample in samples)
         {
             AppendRollingSample(sample);
+            totalNormalizedSampleCount += 1;
             vadFrameSamples.Add(sample);
 
             if (utteranceActive)
@@ -251,7 +270,7 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
                 utteranceSamples.Add(sample);
                 if (utteranceSamples.Count >= maxUtteranceSamples)
                 {
-                    await FinalizeUtteranceAsync(force: true, cancellationToken);
+                    await FinalizeUtteranceAsync("MaxUtteranceMs", cancellationToken);
                 }
             }
 
@@ -260,28 +279,34 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
                 continue;
             }
 
-            await ProcessVadFrameAsync(cancellationToken);
+            var frameStartSample = totalNormalizedSampleCount - vadFrameSamples.Count;
+            chunkContainedSpeechFrame |= await ProcessVadFrameAsync(frameStartSample, cancellationToken);
         }
 
         if (utteranceActive)
         {
             await MaybeEmitPartialAsync(cancellationToken);
         }
+
+        return chunkContainedSpeechFrame;
     }
 
-    private async Task ProcessVadFrameAsync(CancellationToken cancellationToken)
+    private async Task<bool> ProcessVadFrameAsync(long frameStartSample, CancellationToken cancellationToken)
     {
         var frameSamples = CollectionsMarshal.AsSpan(vadFrameSamples);
         var frameRms = CalculateRms(frameSamples);
+        var activeBeforeFrame = utteranceActive;
+        var utteranceIdBeforeFrame = currentUtteranceId;
         maxObservedRmsSinceLastSpeech = Math.Max(maxObservedRmsSinceLastSpeech, frameRms);
         var frameIsSpeech = voiceActivityDetector.IsSpeech(frameSamples);
         if (frameIsSpeech)
         {
             if (!utteranceActive)
             {
-                StartUtterance();
+                StartUtterance(frameRms, CalculatePeakAbsolute(frameSamples));
             }
 
+            currentUtterancePeakRms = Math.Max(currentUtterancePeakRms, frameRms);
             speechSampleCount += vadFrameSamples.Count;
             silenceSampleCount = 0;
             samplesSinceLastSpeech = 0;
@@ -290,10 +315,11 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         }
         else if (utteranceActive)
         {
+            currentUtterancePeakRms = Math.Max(currentUtterancePeakRms, frameRms);
             silenceSampleCount += vadFrameSamples.Count;
             if (silenceSampleCount >= MillisecondsToSamples(options.EndSilenceMs))
             {
-                await FinalizeUtteranceAsync(force: false, cancellationToken);
+                await FinalizeUtteranceAsync("EndSilenceMs", cancellationToken);
             }
         }
         else
@@ -308,15 +334,25 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
             }
         }
 
+        LogVadFrameDiagnostics(
+            utteranceIdBeforeFrame,
+            frameStartSample,
+            vadFrameSamples.Count,
+            frameRms,
+            frameIsSpeech,
+            activeBeforeFrame,
+            utteranceActive);
         vadFrameSamples.Clear();
 
         if (utteranceActive)
         {
             await MaybeEmitPartialAsync(cancellationToken);
         }
+
+        return frameIsSpeech;
     }
 
-    private void StartUtterance()
+    private void StartUtterance(double startFrameRms, double startFramePeak)
     {
         utteranceSequence += 1;
         partialSequence = 0;
@@ -325,6 +361,7 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         speechSampleCount = 0;
         silenceSampleCount = 0;
         lastPartialText = string.Empty;
+        currentUtterancePeakRms = startFrameRms;
         currentUtteranceId = $"{SessionId}-{utteranceSequence:D6}";
         utteranceSamples.Clear();
 
@@ -337,7 +374,10 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         utteranceActive = true;
         samplesSinceLastSpeech = 0;
         maxObservedRmsSinceLastSpeech = 0;
+        utterancesStarted += 1;
         log.Info($"Started utterance. SessionId={SessionId} UtteranceId={currentUtteranceId} SeedSamples={seedSampleCount}");
+        LogUtteranceDiagnostics(
+            $"SpeechStartDetected sessionId={SessionId} utteranceId={currentUtteranceId} preRollMs={options.PreRollMs} rollingBufferDurationMs={SamplesToMilliseconds(rollingSamples.Count):F2} startFrameRms={startFrameRms:F6} startFramePeak={startFramePeak:F6}");
     }
 
     private async Task MaybeEmitPartialAsync(CancellationToken cancellationToken)
@@ -349,7 +389,15 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         }
 
         var partialSamples = TakeLastSamples(utteranceSamples, MillisecondsToSamples(options.PartialWindowMs));
+        var requestSequence = partialSequence + 1;
+        partialTranscriptsRequested += 1;
+        LogUtteranceDiagnostics(
+            $"PartialTranscriptRequested sessionId={SessionId} utteranceId={currentUtteranceId} sequence={requestSequence} audioDurationMs={SamplesToMilliseconds(partialSamples.Count):F2} partialWindowMs={options.PartialWindowMs} reason=scheduled-partial");
+        var stopwatch = Stopwatch.StartNew();
         var text = await TranscribeSamplesAsync(partialSamples, cancellationToken);
+        stopwatch.Stop();
+        LogUtteranceDiagnostics(
+            $"PartialTranscriptReturned sessionId={SessionId} utteranceId={currentUtteranceId} sequence={requestSequence} textLength={text.Length} textPreview=\"{BuildTranscriptPreview(text)}\" elapsedMs={stopwatch.ElapsedMilliseconds}");
         lastPartialAtSampleCount = utteranceSamples.Count;
         if (string.IsNullOrWhiteSpace(text) || string.Equals(text, lastPartialText, StringComparison.OrdinalIgnoreCase))
         {
@@ -372,7 +420,7 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         });
     }
 
-    private async Task FinalizeUtteranceAsync(bool force, CancellationToken cancellationToken)
+    private async Task FinalizeUtteranceAsync(string endReason, CancellationToken cancellationToken)
     {
         if (!utteranceActive)
         {
@@ -388,25 +436,70 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
             ? utteranceSamples.GetRange(0, finalSampleCount)
             : [];
         var shouldFinalize = speechSampleCount >= minimumSamples && finalSamples.Count > 0;
+        var totalDurationMs = SamplesToMilliseconds(utteranceSamples.Count);
+        var detectedSpeechDurationMs = SamplesToMilliseconds(speechSampleCount);
+        var detectedSpeechSampleCount = speechSampleCount;
+        var trailingSilenceMs = SamplesToMilliseconds(silenceSampleCount);
+        var averageRms = CalculateRms(CollectionsMarshal.AsSpan(utteranceSamples));
+        var peakRms = currentUtterancePeakRms;
+        var utteranceSamplesForDebug = utteranceSamples.ToArray();
+
+        LogUtteranceDiagnostics(
+            $"UtteranceEndpointDetected sessionId={SessionId} utteranceId={utteranceId} totalDurationMs={totalDurationMs:F2} detectedSpeechDurationMs={detectedSpeechDurationMs:F2} trailingSilenceMs={trailingSilenceMs:F2} endReason={endReason}");
 
         ResetUtteranceState();
 
         if (!shouldFinalize)
         {
+            var dropReason = DetermineDropReason(finalSamples.Count, detectedSpeechSampleCount, minimumSamples);
+            var savedDebugPath = SaveDebugUtterance(
+                utteranceId,
+                status: "dropped",
+                reason: dropReason,
+                samples: finalSamples.Count > 0 ? finalSamples : utteranceSamplesForDebug,
+                totalDurationMs,
+                detectedSpeechDurationMs,
+                averageRms,
+                peakRms,
+                transcriptText: null);
+            RecordDroppedUtterance(dropReason, totalDurationMs);
             log.Info(
-                $"Dropped short utterance. SessionId={SessionId} UtteranceId={utteranceId} SpeechMs={SamplesToMilliseconds(speechSampleCount):F2} Force={force}");
+                $"Dropped utterance. SessionId={SessionId} UtteranceId={utteranceId} Reason={dropReason} SpeechMs={detectedSpeechDurationMs:F2}");
+            LogUtteranceDiagnostics(
+                $"UtteranceDropped sessionId={SessionId} utteranceId={utteranceId} reason={dropReason} totalDurationMs={totalDurationMs:F2} detectedSpeechDurationMs={detectedSpeechDurationMs:F2} minimumUtteranceMs={options.MinimumUtteranceMs} averageRms={averageRms:F6} peakRms={peakRms:F6} savedDebugWavPath={savedDebugPath ?? string.Empty}");
             return;
         }
 
+        finalTranscriptsRequested += 1;
+        LogUtteranceDiagnostics(
+            $"FinalTranscriptRequested sessionId={SessionId} utteranceId={utteranceId} finalAudioDurationMs={SamplesToMilliseconds(finalSamples.Count):F2} preRollIncludedMs={options.PreRollMs} postRollIncludedMs={options.PostRollMs} endReason={endReason}");
+        var stopwatch = Stopwatch.StartNew();
         var text = await TranscribeSamplesAsync(finalSamples, cancellationToken);
+        stopwatch.Stop();
+        LogUtteranceDiagnostics(
+            $"FinalTranscriptReturned sessionId={SessionId} utteranceId={utteranceId} textLength={text.Length} textPreview=\"{BuildTranscriptPreview(text)}\" elapsedMs={stopwatch.ElapsedMilliseconds}");
         if (string.IsNullOrWhiteSpace(text))
         {
+            var dropReason = "EmptyWhisperResult";
+            var savedDebugPath = SaveDebugUtterance(
+                utteranceId,
+                status: "dropped",
+                reason: dropReason,
+                samples: finalSamples,
+                totalDurationMs,
+                detectedSpeechDurationMs,
+                averageRms,
+                peakRms,
+                transcriptText: text);
+            RecordDroppedUtterance(dropReason, totalDurationMs);
+            LogUtteranceDiagnostics(
+                $"UtteranceDropped sessionId={SessionId} utteranceId={utteranceId} reason={dropReason} totalDurationMs={totalDurationMs:F2} detectedSpeechDurationMs={detectedSpeechDurationMs:F2} minimumUtteranceMs={options.MinimumUtteranceMs} averageRms={averageRms:F6} peakRms={peakRms:F6} savedDebugWavPath={savedDebugPath ?? string.Empty}");
             return;
         }
 
         AppendPromptContext(text);
         var snapshotCopy = CreateSnapshot();
-        updatesChannel.Writer.TryWrite(new ServerEnvelope
+        var emitted = updatesChannel.Writer.TryWrite(new ServerEnvelope
         {
             Type = "final-transcript",
             SessionId = SessionId,
@@ -416,6 +509,24 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
             ReceivedChunkCount = snapshotCopy.ReceivedChunkCount,
             ReceivedAudioBytes = snapshotCopy.ReceivedAudioBytes,
         });
+        utterancesFinalized += 1;
+        completedUtteranceDurationsMs.Add(totalDurationMs);
+        SaveDebugUtterance(
+            utteranceId,
+            status: "finalized",
+            reason: endReason,
+            samples: finalSamples,
+            totalDurationMs,
+            detectedSpeechDurationMs,
+            averageRms,
+            peakRms,
+            transcriptText: text);
+        if (emitted)
+        {
+            finalTranscriptsEmitted += 1;
+            LogUtteranceDiagnostics(
+                $"FinalTranscriptEmitted sessionId={SessionId} utteranceId={utteranceId} textLength={text.Length} eventType=final-transcript receivedChunkCount={snapshotCopy.ReceivedChunkCount} receivedAudioBytes={snapshotCopy.ReceivedAudioBytes}");
+        }
     }
 
     private void ResetUtteranceState()
@@ -427,6 +538,7 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         lastSpeechSampleExclusive = 0;
         speechSampleCount = 0;
         silenceSampleCount = 0;
+        currentUtterancePeakRms = 0;
         lastPartialText = string.Empty;
         utteranceSamples.Clear();
     }
@@ -502,6 +614,11 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         return samples * 1000.0 / options.TargetSampleRate;
     }
 
+    private double SamplesToMilliseconds(long samples)
+    {
+        return samples * 1000.0 / options.TargetSampleRate;
+    }
+
     private static double CalculateRms(ReadOnlySpan<float> samples)
     {
         if (samples.Length == 0)
@@ -516,6 +633,226 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         }
 
         return Math.Sqrt(squareSum / samples.Length);
+    }
+
+    private static double CalculatePeakAbsolute(ReadOnlySpan<float> samples)
+    {
+        var peak = 0.0;
+        for (var index = 0; index < samples.Length; index += 1)
+        {
+            peak = Math.Max(peak, Math.Abs(samples[index]));
+        }
+
+        return peak;
+    }
+
+    private void LogAudioChunkDiagnostics(AudioChunk chunk, float[] samples, bool chunkContainedSpeechFrame)
+    {
+        if (!options.EnableLiveDiagnostics || !options.LogAudioChunkDiagnostics)
+        {
+            return;
+        }
+
+        var snapshotCopy = CreateSnapshot();
+        log.Info(
+            $"AudioChunkDiagnostics sessionId={SessionId} chunkIndex={snapshotCopy.ReceivedChunkCount} receivedChunkCount={snapshotCopy.ReceivedChunkCount} rawByteLength={chunk.BytesRecorded} normalizedSampleCount={samples.Length} normalizedDurationMs={SamplesToMilliseconds(samples.Length):F2} sampleRate={options.TargetSampleRate} rms={CalculateRms(samples):F6} peakAbsolute={CalculatePeakAbsolute(samples):F6} vadSpeechFrameDetected={chunkContainedSpeechFrame} rollingBufferDurationMs={SamplesToMilliseconds(rollingSamples.Count):F2} utteranceState={FormatUtteranceState(utteranceActive)}");
+    }
+
+    private void LogVadFrameDiagnostics(
+        string utteranceIdBeforeFrame,
+        long frameStartSample,
+        int frameSampleCount,
+        double frameRms,
+        bool isSpeech,
+        bool activeBeforeFrame,
+        bool activeAfterFrame)
+    {
+        if (!options.EnableLiveDiagnostics || !options.LogVadFrameDiagnostics)
+        {
+            return;
+        }
+
+        var utteranceId = string.IsNullOrWhiteSpace(utteranceIdBeforeFrame)
+            ? currentUtteranceId
+            : utteranceIdBeforeFrame;
+        log.Info(
+            $"VadFrameDiagnostics sessionId={SessionId} utteranceId={utteranceId} frameStartMs={SamplesToMilliseconds(frameStartSample):F2} frameDurationMs={SamplesToMilliseconds(frameSampleCount):F2} frameRms={frameRms:F6} threshold={options.VadEnergyThreshold:F6} isSpeech={isSpeech} stateBefore={FormatUtteranceState(activeBeforeFrame)} stateAfter={FormatUtteranceState(activeAfterFrame)}");
+    }
+
+    private void LogUtteranceDiagnostics(string message)
+    {
+        if (!options.EnableLiveDiagnostics || !options.LogUtteranceDiagnostics)
+        {
+            return;
+        }
+
+        log.Info(message);
+    }
+
+    private string? SaveDebugUtterance(
+        string utteranceId,
+        string status,
+        string reason,
+        IReadOnlyList<float> samples,
+        double totalDurationMs,
+        double detectedSpeechDurationMs,
+        double averageRms,
+        double peakRms,
+        string? transcriptText)
+    {
+        if (!options.EnableLiveDiagnostics ||
+            !options.SaveDebugUtteranceWavFiles ||
+            options.MaxDebugUtteranceFilesPerSession <= 0 ||
+            debugUtteranceFilesWritten >= options.MaxDebugUtteranceFilesPerSession)
+        {
+            return null;
+        }
+
+        if (string.Equals(status, "dropped", StringComparison.OrdinalIgnoreCase) && !options.SaveDroppedUtterances)
+        {
+            return null;
+        }
+
+        if (string.Equals(status, "finalized", StringComparison.OrdinalIgnoreCase) && !options.SaveFinalizedUtterances)
+        {
+            return null;
+        }
+
+        try
+        {
+            var sessionDirectory = Path.Combine(options.DebugUtteranceDirectory, SanitizePathSegment(SessionId));
+            Directory.CreateDirectory(sessionDirectory);
+
+            var timestamp = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmss-fff", CultureInfo.InvariantCulture);
+            var baseName = string.Join(
+                "-",
+                timestamp,
+                SanitizePathSegment(utteranceId),
+                SanitizePathSegment(status),
+                SanitizePathSegment(reason));
+            var wavPath = Path.Combine(sessionDirectory, $"{baseName}.wav");
+            var jsonPath = Path.Combine(sessionDirectory, $"{baseName}.json");
+            var waveBytes = WavePcm16Writer.WriteWaveFile(samples, options.TargetSampleRate);
+            File.WriteAllBytes(wavPath, waveBytes);
+            debugUtteranceFilesWritten += 1;
+
+            try
+            {
+                var metadata = new
+                {
+                    sessionId = SessionId,
+                    utteranceId,
+                    status,
+                    reason,
+                    totalDurationMs,
+                    detectedSpeechDurationMs,
+                    averageRms,
+                    peakRms,
+                    vadEnergyThreshold = options.VadEnergyThreshold,
+                    minimumUtteranceMs = options.MinimumUtteranceMs,
+                    endSilenceMs = options.EndSilenceMs,
+                    preRollMs = options.PreRollMs,
+                    postRollMs = options.PostRollMs,
+                    sampleRate = options.TargetSampleRate,
+                    transcriptText,
+                    transcriptTextLength = transcriptText?.Length ?? 0,
+                    createdAtUtc = DateTimeOffset.UtcNow
+                };
+                var json = JsonSerializer.Serialize(metadata, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(jsonPath, json);
+            }
+            catch (Exception ex)
+            {
+                log.Warn($"Failed to write debug utterance metadata. SessionId={SessionId} UtteranceId={utteranceId} Path={jsonPath} ExceptionType={ex.GetType().Name} Message={ex.Message}");
+            }
+
+            return Path.GetFullPath(wavPath);
+        }
+        catch (Exception ex)
+        {
+            log.Warn($"Failed to write debug utterance WAV. SessionId={SessionId} UtteranceId={utteranceId} Status={status} Reason={reason} Directory={options.DebugUtteranceDirectory} ExceptionType={ex.GetType().Name} Message={ex.Message}");
+            return null;
+        }
+    }
+
+    private void RecordDroppedUtterance(string reason, double totalDurationMs)
+    {
+        utterancesDropped += 1;
+        completedUtteranceDurationsMs.Add(totalDurationMs);
+        dropCountsByReason.TryGetValue(reason, out var existingCount);
+        dropCountsByReason[reason] = existingCount + 1;
+    }
+
+    private static string DetermineDropReason(int finalSampleCount, int detectedSpeechSampleCount, int minimumSampleCount)
+    {
+        if (finalSampleCount <= 0)
+        {
+            return "EmptyAudio";
+        }
+
+        if (detectedSpeechSampleCount <= 0)
+        {
+            return "NoSpeechDetected";
+        }
+
+        if (detectedSpeechSampleCount < minimumSampleCount)
+        {
+            return "BelowMinimumUtteranceMs";
+        }
+
+        return "Other";
+    }
+
+    private void LogSessionSummary()
+    {
+        if (!options.EnableLiveDiagnostics || sessionSummaryLogged)
+        {
+            return;
+        }
+
+        sessionSummaryLogged = true;
+        var snapshotCopy = CreateSnapshot();
+        var averageUtteranceDurationMs = completedUtteranceDurationsMs.Count == 0 ? 0 : completedUtteranceDurationsMs.Average();
+        var minUtteranceDurationMs = completedUtteranceDurationsMs.Count == 0 ? 0 : completedUtteranceDurationsMs.Min();
+        var maxUtteranceDurationMs = completedUtteranceDurationsMs.Count == 0 ? 0 : completedUtteranceDurationsMs.Max();
+        log.Info(
+            $"LiveDiagnosticsSummary sessionId={SessionId} receivedChunkCount={snapshotCopy.ReceivedChunkCount} receivedAudioBytes={snapshotCopy.ReceivedAudioBytes} totalNormalizedAudioDurationMs={SamplesToMilliseconds(totalNormalizedSampleCount):F2} utterancesStarted={utterancesStarted} utterancesFinalized={utterancesFinalized} utterancesDropped={utterancesDropped} partialTranscriptsRequested={partialTranscriptsRequested} finalTranscriptsRequested={finalTranscriptsRequested} finalTranscriptsEmitted={finalTranscriptsEmitted} dropCountsByReason={FormatDropCounts()} averageUtteranceDurationMs={averageUtteranceDurationMs:F2} minUtteranceDurationMs={minUtteranceDurationMs:F2} maxUtteranceDurationMs={maxUtteranceDurationMs:F2} debugWavFilesWritten={debugUtteranceFilesWritten}");
+    }
+
+    private string FormatDropCounts()
+    {
+        if (dropCountsByReason.Count == 0)
+        {
+            return "none";
+        }
+
+        return string.Join(";", dropCountsByReason.OrderBy(x => x.Key, StringComparer.Ordinal).Select(x => $"{x.Key}:{x.Value}"));
+    }
+
+    private static string FormatUtteranceState(bool active)
+    {
+        return active ? "active" : "idle";
+    }
+
+    private static string BuildTranscriptPreview(string text)
+    {
+        const int MaxPreviewLength = 120;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return string.Empty;
+        }
+
+        var normalized = text.ReplaceLineEndings(" ").Trim();
+        return normalized.Length <= MaxPreviewLength
+            ? normalized
+            : normalized[..MaxPreviewLength];
+    }
+
+    private static string SanitizePathSegment(string value)
+    {
+        var invalidChars = Path.GetInvalidFileNameChars();
+        var sanitized = new string(value.Select(ch => invalidChars.Contains(ch) ? '_' : ch).ToArray()).Trim();
+        return string.IsNullOrWhiteSpace(sanitized) ? "unknown" : sanitized;
     }
 
     private bool ShouldFlushPendingAudio()

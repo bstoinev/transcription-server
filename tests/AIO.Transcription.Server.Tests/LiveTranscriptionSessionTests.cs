@@ -76,6 +76,168 @@ public sealed class LiveTranscriptionSessionTests
     }
 
     [Fact]
+    public async Task DiagnosticsDisabledProducesNoDebugWavFiles()
+    {
+        var directory = CreateTemporaryDiagnosticsDirectory();
+        try
+        {
+            var transcriber = new RecordingTranscriber();
+            var options = CreateOptions();
+            options.MinimumUtteranceMs = 500;
+            options.EnableLiveDiagnostics = false;
+            options.SaveDebugUtteranceWavFiles = true;
+            options.DebugUtteranceDirectory = directory;
+            await using var session = CreateSession(transcriber, options);
+
+            await AddChunksAsync(session, amplitude: 0.1f, chunkCount: 4);
+            await AddChunksAsync(session, amplitude: 0.0f, chunkCount: 2);
+            await session.CompleteAsync(flushPendingAudio: true, CancellationToken.None);
+
+            Assert.Empty(GetDebugWavFiles(directory));
+        }
+        finally
+        {
+            DeleteTemporaryPath(directory);
+        }
+    }
+
+    [Fact]
+    public async Task DroppedUtteranceCanProduceDebugWavWithBelowMinimumReason()
+    {
+        var directory = CreateTemporaryDiagnosticsDirectory();
+        try
+        {
+            var transcriber = new RecordingTranscriber();
+            var options = CreateDiagnosticsOptions(directory);
+            await using var session = CreateSession(transcriber, options);
+
+            await AddChunksAsync(session, amplitude: 0.1f, chunkCount: 2);
+            await AddChunksAsync(session, amplitude: 0.0f, chunkCount: 2);
+            await session.CompleteAsync(flushPendingAudio: true, CancellationToken.None);
+
+            var updates = await ReadAllUpdatesAsync(session);
+            Assert.DoesNotContain(updates, x => x.Type == "final-transcript");
+            var wavPath = Assert.Single(GetDebugWavFiles(directory));
+            AssertWaveFile(wavPath);
+            using var metadata = ReadSingleDebugMetadata(directory);
+            Assert.Equal("dropped", metadata.RootElement.GetProperty("status").GetString());
+            Assert.Equal("BelowMinimumUtteranceMs", metadata.RootElement.GetProperty("reason").GetString());
+        }
+        finally
+        {
+            DeleteTemporaryPath(directory);
+        }
+    }
+
+    [Fact]
+    public async Task FinalizedUtteranceCanProduceDebugWav()
+    {
+        var directory = CreateTemporaryDiagnosticsDirectory();
+        try
+        {
+            var transcriber = new RecordingTranscriber();
+            var options = CreateDiagnosticsOptions(directory);
+            options.MinimumUtteranceMs = 500;
+            await using var session = CreateSession(transcriber, options);
+
+            await AddChunksAsync(session, amplitude: 0.1f, chunkCount: 4);
+            await AddChunksAsync(session, amplitude: 0.0f, chunkCount: 2);
+            await session.CompleteAsync(flushPendingAudio: true, CancellationToken.None);
+
+            var updates = await ReadAllUpdatesAsync(session);
+            Assert.Single(updates, x => x.Type == "final-transcript");
+            var wavPath = Assert.Single(GetDebugWavFiles(directory));
+            AssertWaveFile(wavPath);
+            using var metadata = ReadSingleDebugMetadata(directory);
+            Assert.Equal("finalized", metadata.RootElement.GetProperty("status").GetString());
+            Assert.Equal("EndSilenceMs", metadata.RootElement.GetProperty("reason").GetString());
+            Assert.StartsWith("text-", metadata.RootElement.GetProperty("transcriptText").GetString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            DeleteTemporaryPath(directory);
+        }
+    }
+
+    [Fact]
+    public async Task MaxDebugUtteranceFilesPerSessionIsRespected()
+    {
+        var directory = CreateTemporaryDiagnosticsDirectory();
+        try
+        {
+            var transcriber = new RecordingTranscriber();
+            var options = CreateDiagnosticsOptions(directory);
+            options.MaxDebugUtteranceFilesPerSession = 1;
+            await using var session = CreateSession(transcriber, options);
+
+            await AddChunksAsync(session, amplitude: 0.1f, chunkCount: 2);
+            await AddChunksAsync(session, amplitude: 0.0f, chunkCount: 2);
+            await AddChunksAsync(session, amplitude: 0.1f, chunkCount: 2);
+            await AddChunksAsync(session, amplitude: 0.0f, chunkCount: 2);
+            await session.CompleteAsync(flushPendingAudio: true, CancellationToken.None);
+
+            Assert.Single(GetDebugWavFiles(directory));
+        }
+        finally
+        {
+            DeleteTemporaryPath(directory);
+        }
+    }
+
+    [Fact]
+    public async Task EmptyWhisperResultIsRecordedDistinctlyFromBelowMinimumUtterance()
+    {
+        var directory = CreateTemporaryDiagnosticsDirectory();
+        try
+        {
+            var transcriber = new RecordingTranscriber(_ => string.Empty);
+            var options = CreateDiagnosticsOptions(directory);
+            options.MinimumUtteranceMs = 500;
+            await using var session = CreateSession(transcriber, options);
+
+            await AddChunksAsync(session, amplitude: 0.1f, chunkCount: 4);
+            await AddChunksAsync(session, amplitude: 0.0f, chunkCount: 2);
+            await session.CompleteAsync(flushPendingAudio: true, CancellationToken.None);
+
+            var updates = await ReadAllUpdatesAsync(session);
+            Assert.DoesNotContain(updates, x => x.Type == "final-transcript");
+            using var metadata = ReadSingleDebugMetadata(directory);
+            Assert.Equal("dropped", metadata.RootElement.GetProperty("status").GetString());
+            Assert.Equal("EmptyWhisperResult", metadata.RootElement.GetProperty("reason").GetString());
+        }
+        finally
+        {
+            DeleteTemporaryPath(directory);
+        }
+    }
+
+    [Fact]
+    public async Task DebugWavSaveFailureDoesNotCrashSession()
+    {
+        var directory = CreateTemporaryDiagnosticsDirectory();
+        try
+        {
+            var badDebugDirectory = Path.Combine(directory, "not-a-directory");
+            File.WriteAllText(badDebugDirectory, "occupied");
+            var transcriber = new RecordingTranscriber();
+            var options = CreateDiagnosticsOptions(badDebugDirectory);
+            options.MinimumUtteranceMs = 500;
+            await using var session = CreateSession(transcriber, options);
+
+            await AddChunksAsync(session, amplitude: 0.1f, chunkCount: 4);
+            await AddChunksAsync(session, amplitude: 0.0f, chunkCount: 2);
+            await session.CompleteAsync(flushPendingAudio: true, CancellationToken.None);
+
+            var updates = await ReadAllUpdatesAsync(session);
+            Assert.Single(updates, x => x.Type == "final-transcript");
+        }
+        finally
+        {
+            DeleteTemporaryPath(directory);
+        }
+    }
+
+    [Fact]
     public async Task MaxUtteranceForcesFinalization()
     {
         var transcriber = new RecordingTranscriber();
@@ -230,6 +392,15 @@ public sealed class LiveTranscriptionSessionTests
         };
     }
 
+    private static WhisperTranscriberOptions CreateDiagnosticsOptions(string directory)
+    {
+        var options = CreateOptions();
+        options.EnableLiveDiagnostics = true;
+        options.SaveDebugUtteranceWavFiles = true;
+        options.DebugUtteranceDirectory = directory;
+        return options;
+    }
+
     private static async Task AddChunksAsync(LiveTranscriptionSession session, float amplitude, int chunkCount)
     {
         for (var index = 0; index < chunkCount; index += 1)
@@ -280,8 +451,57 @@ public sealed class LiveTranscriptionSessionTests
         return [.. updates];
     }
 
+    private static string CreateTemporaryDiagnosticsDirectory()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "aio-transcription-diagnostics-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        return directory;
+    }
+
+    private static void DeleteTemporaryPath(string path)
+    {
+        if (File.Exists(path))
+        {
+            File.Delete(path);
+            return;
+        }
+
+        if (Directory.Exists(path))
+        {
+            Directory.Delete(path, recursive: true);
+        }
+    }
+
+    private static string[] GetDebugWavFiles(string directory)
+    {
+        return Directory.Exists(directory)
+            ? Directory.GetFiles(directory, "*.wav", SearchOption.AllDirectories)
+            : [];
+    }
+
+    private static JsonDocument ReadSingleDebugMetadata(string directory)
+    {
+        var jsonPath = Assert.Single(Directory.GetFiles(directory, "*.json", SearchOption.AllDirectories));
+        return JsonDocument.Parse(File.ReadAllText(jsonPath));
+    }
+
+    private static void AssertWaveFile(string wavPath)
+    {
+        var bytes = File.ReadAllBytes(wavPath);
+        Assert.True(bytes.Length > 44);
+        Assert.Equal("RIFF", System.Text.Encoding.ASCII.GetString(bytes, 0, 4));
+        Assert.Equal("WAVE", System.Text.Encoding.ASCII.GetString(bytes, 8, 4));
+    }
+
     private sealed class RecordingTranscriber : IWaveTranscriber
     {
+        private readonly Func<int, string> responseFactory;
+
+        public RecordingTranscriber(Func<int, string>? responseFactory = null)
+        {
+            this.responseFactory = responseFactory ?? (requestNumber => $"text-{requestNumber}");
+        }
+
         public List<RecordedRequest> Requests { get; } = [];
 
         public Task WarmUpAsync(CancellationToken cancellationToken)
@@ -292,7 +512,7 @@ public sealed class LiveTranscriptionSessionTests
         public Task<string> TranscribeWaveAsync(WaveTranscriptionRequest request, CancellationToken cancellationToken)
         {
             var durationMs = (request.WaveBytes.Length - 44) / 2 * 1000 / 16000;
-            var text = $"text-{Requests.Count + 1}";
+            var text = responseFactory(Requests.Count + 1);
             Requests.Add(new RecordedRequest(durationMs, request.Prompt, request.Language, request.EnableLanguageDetection));
             return Task.FromResult(text);
         }

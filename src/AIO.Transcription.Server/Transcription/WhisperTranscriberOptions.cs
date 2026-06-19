@@ -27,6 +27,15 @@ public sealed class WhisperTranscriberOptions
     public string? Language { get; set; } = "en";
     public bool EnableLanguageDetection { get; set; }
     public int PromptContextCharacters { get; set; } = DefaultPromptContextCharacters;
+    public bool EnableLiveDiagnostics { get; set; }
+    public bool LogAudioChunkDiagnostics { get; set; }
+    public bool LogVadFrameDiagnostics { get; set; }
+    public bool LogUtteranceDiagnostics { get; set; } = true;
+    public bool SaveDebugUtteranceWavFiles { get; set; }
+    public string DebugUtteranceDirectory { get; set; } = "debug-audio";
+    public bool SaveDroppedUtterances { get; set; } = true;
+    public bool SaveFinalizedUtterances { get; set; } = true;
+    public int MaxDebugUtteranceFilesPerSession { get; set; } = 100;
 
     public WhisperTranscriberOptions Clone()
     {
@@ -55,6 +64,15 @@ public sealed class WhisperTranscriberOptions
             Language = Language,
             EnableLanguageDetection = EnableLanguageDetection,
             PromptContextCharacters = PromptContextCharacters,
+            EnableLiveDiagnostics = EnableLiveDiagnostics,
+            LogAudioChunkDiagnostics = LogAudioChunkDiagnostics,
+            LogVadFrameDiagnostics = LogVadFrameDiagnostics,
+            LogUtteranceDiagnostics = LogUtteranceDiagnostics,
+            SaveDebugUtteranceWavFiles = SaveDebugUtteranceWavFiles,
+            DebugUtteranceDirectory = DebugUtteranceDirectory,
+            SaveDroppedUtterances = SaveDroppedUtterances,
+            SaveFinalizedUtterances = SaveFinalizedUtterances,
+            MaxDebugUtteranceFilesPerSession = MaxDebugUtteranceFilesPerSession,
         };
     }
 
@@ -100,6 +118,11 @@ public sealed class WhisperTranscriberOptions
             throw new InvalidOperationException("Transcription:MinimumUtteranceMs must be less than or equal to Transcription:MaxUtteranceMs.");
         }
 
+        if (MaxDebugUtteranceFilesPerSession < 0)
+        {
+            throw new InvalidOperationException("Transcription:MaxDebugUtteranceFilesPerSession must be greater than or equal to zero.");
+        }
+
         if (string.IsNullOrWhiteSpace(Language))
         {
             Language = "en";
@@ -108,6 +131,11 @@ public sealed class WhisperTranscriberOptions
         if (!string.IsNullOrWhiteSpace(ModelType))
         {
             ModelType = ModelType.Trim();
+        }
+
+        if (string.IsNullOrWhiteSpace(DebugUtteranceDirectory))
+        {
+            DebugUtteranceDirectory = "debug-audio";
         }
     }
 }

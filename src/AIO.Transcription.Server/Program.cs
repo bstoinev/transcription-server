@@ -73,350 +73,363 @@ app.Map("/ws/transcribe", async context =>
     logger.Info(
         $"Accepted websocket connection. Remote={context.Connection.RemoteIpAddress}:{context.Connection.RemotePort} Local={context.Connection.LocalIpAddress}:{context.Connection.LocalPort}");
 
-    var capabilities = WhisperModelCatalog.BuildCapabilities(
-        context.RequestServices.GetRequiredService<WhisperTranscriberOptions>());
-    await TrySendEnvelopeAsync(new ServerEnvelope
+    try
     {
-        Type = "server-ready",
-        Message = "Connected. Select a model and send start-session first.",
-        Capabilities = capabilities
-    }, context.RequestAborted);
-    while (socket.State == WebSocketState.Open && !context.RequestAborted.IsCancellationRequested)
-    {
-        var receivedMessage = await ReceiveMessageAsync(socket, buffer, context.RequestAborted);
-        if (receivedMessage is null)
+        var capabilities = WhisperModelCatalog.BuildCapabilities(
+            context.RequestServices.GetRequiredService<WhisperTranscriberOptions>());
+        await TrySendEnvelopeAsync(new ServerEnvelope
         {
-            logger.Info($"Client initiated websocket close. ActiveSessionCount={connectionSessions.Count} ActiveSessionIds={FormatSessionIds(connectionSessions.Keys)}");
-            break;
-        }
+            Type = "server-ready",
+            Message = "Connected. Select a model and send start-session first.",
+            Capabilities = capabilities
+        }, context.RequestAborted);
+        while (socket.State == WebSocketState.Open && !context.RequestAborted.IsCancellationRequested)
+        {
+            var receivedMessage = await ReceiveMessageAsync(socket, buffer, context.RequestAborted);
+            if (receivedMessage is null)
+            {
+                logger.Info($"Client initiated websocket close. ActiveSessionCount={connectionSessions.Count} ActiveSessionIds={FormatSessionIds(connectionSessions.Keys)}");
+                break;
+            }
 
-        if (receivedMessage.Value.MessageType == WebSocketMessageType.Binary)
-        {
-            ConnectionSessionState? binarySession = null;
+            if (receivedMessage.Value.MessageType == WebSocketMessageType.Binary)
+            {
+                ConnectionSessionState? binarySession = null;
+                try
+                {
+                    if (connectionSessions.Count == 0)
+                    {
+                        await TrySendEnvelopeAsync(new ServerEnvelope { Type = "error", Message = "No active session. Send start-session first." }, context.RequestAborted);
+                        continue;
+                    }
+
+                    if (connectionSessions.Count > 1)
+                    {
+                        await TrySendEnvelopeAsync(new ServerEnvelope
+                        {
+                            Type = "error",
+                            Message = "Binary audio requires exactly one active session on the websocket. Use JSON audio-chunk with sessionId when multiple sessions are active."
+                        }, context.RequestAborted);
+                        continue;
+                    }
+
+                    binarySession = connectionSessions.Values.First();
+                    if (string.IsNullOrWhiteSpace(binarySession.ActiveEncoding) || binarySession.ActiveSampleRate is null || binarySession.ActiveChannels is null)
+                    {
+                        await TrySendEnvelopeAsync(new ServerEnvelope
+                        {
+                            Type = "error",
+                            SessionId = binarySession.SessionId,
+                            Message = "Binary audio requires encoding, sampleRate, and channels to be established by start-session or a prior audio-chunk."
+                        }, context.RequestAborted);
+                        continue;
+                    }
+
+                    var audioBytes = receivedMessage.Value.Payload.ToArray();
+                    await binarySession.Session.AddAudioChunkAsync(new AudioChunk(
+                        audioBytes,
+                        audioBytes.Length,
+                        binarySession.ActiveSampleRate.Value,
+                        binarySession.ActiveChannels.Value,
+                        binarySession.ActiveEncoding,
+                        DateTimeOffset.UtcNow), context.RequestAborted);
+                    continue;
+                }
+                catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+                {
+                    logger.Warn($"Request aborted while processing websocket binary audio. SessionId={binarySession?.SessionId ?? "<none>"}");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    logger.Error($"WebSocket binary message processing failed. SessionId={binarySession?.SessionId ?? "<none>"}", ex);
+                    if (socket.State == WebSocketState.Open)
+                    {
+                        await TrySendEnvelopeAsync(new ServerEnvelope
+                        {
+                            Type = "error",
+                            SessionId = binarySession?.SessionId ?? string.Empty,
+                            Message = $"Server failed to process binary audio: {ex.Message}"
+                        }, context.RequestAborted);
+                        await socket.CloseAsync(WebSocketCloseStatus.InternalServerError, "server-processing-failed", context.RequestAborted);
+                    }
+
+                    break;
+                }
+            }
+
+            ClientEnvelope? clientEnvelope;
             try
             {
-                if (connectionSessions.Count == 0)
+                clientEnvelope = JsonSerializer.Deserialize<ClientEnvelope>(receivedMessage.Value.Payload.Span, JsonOptions.WebSocket);
+            }
+            catch (JsonException ex)
+            {
+                await SendAsync(socket, new ServerEnvelope
                 {
-                    await TrySendEnvelopeAsync(new ServerEnvelope { Type = "error", Message = "No active session. Send start-session first." }, context.RequestAborted);
-                    continue;
-                }
-
-                if (connectionSessions.Count > 1)
-                {
-                    await TrySendEnvelopeAsync(new ServerEnvelope
-                    {
-                        Type = "error",
-                        Message = "Binary audio requires exactly one active session on the websocket. Use JSON audio-chunk with sessionId when multiple sessions are active."
-                    }, context.RequestAborted);
-                    continue;
-                }
-
-                binarySession = connectionSessions.Values.First();
-                if (string.IsNullOrWhiteSpace(binarySession.ActiveEncoding) || binarySession.ActiveSampleRate is null || binarySession.ActiveChannels is null)
-                {
-                    await TrySendEnvelopeAsync(new ServerEnvelope
-                    {
-                        Type = "error",
-                        SessionId = binarySession.SessionId,
-                        Message = "Binary audio requires encoding, sampleRate, and channels to be established by start-session or a prior audio-chunk."
-                    }, context.RequestAborted);
-                    continue;
-                }
-
-                var audioBytes = receivedMessage.Value.Payload.ToArray();
-                await binarySession.Session.AddAudioChunkAsync(new AudioChunk(
-                    audioBytes,
-                    audioBytes.Length,
-                    binarySession.ActiveSampleRate.Value,
-                    binarySession.ActiveChannels.Value,
-                    binarySession.ActiveEncoding,
-                    DateTimeOffset.UtcNow), context.RequestAborted);
+                    Type = "error",
+                    Message = $"Invalid JSON envelope: {ex.Message}"
+                }, context.RequestAborted);
                 continue;
+            }
+
+            if (clientEnvelope is null)
+            {
+                await SendAsync(socket, new ServerEnvelope
+                {
+                    Type = "error",
+                    Message = "Empty JSON envelope."
+                }, context.RequestAborted);
+                continue;
+            }
+
+            try
+            {
+                switch (clientEnvelope.Type)
+                {
+                    case "start-session":
+                        if (string.IsNullOrWhiteSpace(clientEnvelope.SessionId))
+                        {
+                            await TrySendEnvelopeAsync(new ServerEnvelope { Type = "error", Message = "sessionId is required for start-session." }, context.RequestAborted);
+                            continue;
+                        }
+
+                        if (connectionSessions.TryGetValue(clientEnvelope.SessionId, out var existingConnectionSession))
+                        {
+                            logger.Warn(
+                                $"Rejected start-session because the sessionId is already active on this websocket. RequestedSessionId={clientEnvelope.SessionId} ActiveSessionId={existingConnectionSession.SessionId}");
+                            await TrySendEnvelopeAsync(new ServerEnvelope
+                            {
+                                Type = "error",
+                                SessionId = existingConnectionSession.SessionId,
+                                Message = "A session with this sessionId is already active on this connection."
+                            }, context.RequestAborted);
+                            continue;
+                        }
+
+                        WhisperTranscriberOptions sessionOptions;
+                        try
+                        {
+                            sessionOptions = WhisperModelCatalog.CreateSessionOptions(
+                                context.RequestServices.GetRequiredService<WhisperTranscriberOptions>(),
+                                clientEnvelope.ModelType,
+                                clientEnvelope.Prompt,
+                                clientEnvelope.Language,
+                                clientEnvelope.EnableLanguageDetection);
+                        }
+                        catch (InvalidOperationException ex)
+                        {
+                            await TrySendEnvelopeAsync(new ServerEnvelope
+                            {
+                                Type = "error",
+                                SessionId = clientEnvelope.SessionId,
+                                Message = ex.Message
+                            }, context.RequestAborted);
+                            continue;
+                        }
+
+                        SessionCreateResult createResult;
+                        try
+                        {
+                            createResult = await registry.TryCreateAsync(clientEnvelope.SessionId, sessionOptions, context.RequestAborted);
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.Error(
+                                $"Session warm-up failed. SessionId={clientEnvelope.SessionId} ModelType={sessionOptions.ModelType}",
+                                ex);
+                            await TrySendEnvelopeAsync(new ServerEnvelope
+                            {
+                                Type = "error",
+                                SessionId = clientEnvelope.SessionId,
+                                ModelType = sessionOptions.ModelType,
+                                Message = $"Unable to start session: {ex.Message}"
+                            }, context.RequestAborted);
+                            continue;
+                        }
+
+                        if (!createResult.Created || createResult.Session is null)
+                        {
+                            await TrySendEnvelopeAsync(new ServerEnvelope
+                            {
+                                Type = "error",
+                                SessionId = clientEnvelope.SessionId,
+                                ModelType = sessionOptions.ModelType,
+                                Message = createResult.RejectionReason ?? "Unable to create session."
+                            }, context.RequestAborted);
+                            continue;
+                        }
+
+                        var started = createResult.Session;
+                        var startedState = new ConnectionSessionState(
+                            started,
+                            ForwardSessionUpdatesAsync(started, TrySendEnvelopeAsync, logger, context.RequestAborted))
+                        {
+                            ActiveEncoding = NormalizeEncoding(clientEnvelope.Encoding),
+                            ActiveSampleRate = clientEnvelope.SampleRate,
+                            ActiveChannels = clientEnvelope.Channels
+                        };
+                        connectionSessions[started.SessionId] = startedState;
+                        var startedSnapshot = started.CreateSnapshot();
+                        logger.Info(
+                            $"Session started using client-provided sessionId. SessionId={started.SessionId} ModelType={started.ModelType} Encoding={clientEnvelope.Encoding ?? "<null>"} SampleRate={clientEnvelope.SampleRate?.ToString() ?? "<null>"} Channels={clientEnvelope.Channels?.ToString() ?? "<null>"} ConnectionSessionCount={connectionSessions.Count}");
+                        await TrySendEnvelopeAsync(new ServerEnvelope
+                        {
+                            Type = "session-started",
+                            SessionId = started.SessionId,
+                            Message = "Live transcription session started for the provided sessionId.",
+                            ModelType = started.ModelType,
+                            ReceivedChunkCount = startedSnapshot.ReceivedChunkCount,
+                            ReceivedAudioBytes = startedSnapshot.ReceivedAudioBytes,
+                        }, context.RequestAborted);
+                        break;
+
+                    case "audio-chunk":
+                        var audioSession = await ResolveConnectionSessionAsync(clientEnvelope.SessionId, "audio-chunk", "No active session. Send start-session first.");
+                        if (audioSession is null)
+                        {
+                            continue;
+                        }
+
+                        if (string.IsNullOrWhiteSpace(clientEnvelope.AudioBase64))
+                        {
+                            await TrySendEnvelopeAsync(new ServerEnvelope { Type = "error", SessionId = audioSession.SessionId, Message = "audioBase64 is required for audio-chunk." }, context.RequestAborted);
+                            continue;
+                        }
+
+                        byte[] audioBytes;
+                        try
+                        {
+                            audioBytes = Convert.FromBase64String(clientEnvelope.AudioBase64);
+                        }
+                        catch (FormatException)
+                        {
+                            await TrySendEnvelopeAsync(new ServerEnvelope { Type = "error", SessionId = audioSession.SessionId, Message = "audioBase64 is not valid base64." }, context.RequestAborted);
+                            continue;
+                        }
+
+                        var resolvedEncoding = NormalizeEncoding(clientEnvelope.Encoding) ?? audioSession.ActiveEncoding ?? "f32le";
+                        var resolvedSampleRate = clientEnvelope.SampleRate ?? audioSession.ActiveSampleRate ?? 48000;
+                        var resolvedChannels = clientEnvelope.Channels ?? audioSession.ActiveChannels ?? 2;
+                        audioSession.ActiveEncoding = resolvedEncoding;
+                        audioSession.ActiveSampleRate = resolvedSampleRate;
+                        audioSession.ActiveChannels = resolvedChannels;
+
+                        await audioSession.Session.AddAudioChunkAsync(new AudioChunk(
+                            audioBytes,
+                            audioBytes.Length,
+                            resolvedSampleRate,
+                            resolvedChannels,
+                            resolvedEncoding,
+                            DateTimeOffset.UtcNow), context.RequestAborted);
+                        break;
+
+                    case "simulate-text":
+                        var simulatedSession = await ResolveConnectionSessionAsync(clientEnvelope.SessionId, "simulate-text", "No active session. Send start-session first.");
+                        if (simulatedSession is null)
+                        {
+                            continue;
+                        }
+
+                        var simulatedFinalEvent = clientEnvelope.IsFinalChunk ?? true;
+                        logger.Warn($"Simulated transcript requested. SessionId={simulatedSession.SessionId} FinalEvent={simulatedFinalEvent}");
+                        await TrySendEnvelopeAsync(new ServerEnvelope
+                        {
+                            Type = simulatedFinalEvent ? "final-transcript" : "partial-transcript",
+                            SessionId = simulatedSession.SessionId,
+                            Message = "Simulated transcript event.",
+                            UtteranceId = $"{simulatedSession.SessionId}-simulated",
+                            Sequence = simulatedFinalEvent ? null : 1,
+                            TranscriptText = clientEnvelope.SimulatedText ?? string.Empty,
+                        }, context.RequestAborted);
+                        break;
+
+                    case "end-session":
+                        logger.Info(
+                            $"Received end-session request. RequestedSessionId={clientEnvelope.SessionId ?? "<null>"} ActiveSessionCount={connectionSessions.Count}");
+                        var endingSession = await ResolveConnectionSessionAsync(clientEnvelope.SessionId, "end-session", "No active session to end.");
+                        if (endingSession is null)
+                        {
+                            continue;
+                        }
+
+                        var shutdownCompleted = await ShutdownConnectionSessionAsync(
+                            endingSession.SessionId,
+                            shutdownReason: "client-end-session",
+                            flushPendingAudio: true,
+                            sendSessionEnded: true,
+                            context.RequestAborted);
+                        if (!shutdownCompleted)
+                        {
+                            break;
+                        }
+                        break;
+
+                    default:
+                        logger.Warn($"Unsupported client envelope type. Type={clientEnvelope.Type} SessionId={clientEnvelope.SessionId}");
+                        await TrySendEnvelopeAsync(new ServerEnvelope
+                        {
+                            Type = "error",
+                            SessionId = clientEnvelope.SessionId,
+                            Message = $"Unsupported message type: {clientEnvelope.Type}"
+                        }, context.RequestAborted);
+                        break;
+                }
             }
             catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
             {
-                logger.Warn($"Request aborted while processing websocket binary audio. SessionId={binarySession?.SessionId ?? "<none>"}");
+                logger.Warn($"Request aborted while processing websocket message. SessionId={clientEnvelope.SessionId}");
                 break;
             }
             catch (Exception ex)
             {
-                logger.Error($"WebSocket binary message processing failed. SessionId={binarySession?.SessionId ?? "<none>"}", ex);
+                logger.Error(
+                    $"WebSocket message processing failed. Type={clientEnvelope.Type} SessionId={clientEnvelope.SessionId} Sequence={clientEnvelope.Sequence}",
+                    ex);
+
                 if (socket.State == WebSocketState.Open)
                 {
                     await TrySendEnvelopeAsync(new ServerEnvelope
                     {
                         Type = "error",
-                        SessionId = binarySession?.SessionId ?? string.Empty,
-                        Message = $"Server failed to process binary audio: {ex.Message}"
+                        SessionId = clientEnvelope.SessionId,
+                        Message = $"Server failed to process {clientEnvelope.Type}: {ex.Message}"
                     }, context.RequestAborted);
+
                     await socket.CloseAsync(WebSocketCloseStatus.InternalServerError, "server-processing-failed", context.RequestAborted);
                 }
 
                 break;
             }
         }
-
-        ClientEnvelope? clientEnvelope;
-        try
-        {
-            clientEnvelope = JsonSerializer.Deserialize<ClientEnvelope>(receivedMessage.Value.Payload.Span, JsonOptions.WebSocket);
-        }
-        catch (JsonException ex)
-        {
-            await SendAsync(socket, new ServerEnvelope
-            {
-                Type = "error",
-                Message = $"Invalid JSON envelope: {ex.Message}"
-            }, context.RequestAborted);
-            continue;
-        }
-
-        if (clientEnvelope is null)
-        {
-            await SendAsync(socket, new ServerEnvelope
-            {
-                Type = "error",
-                Message = "Empty JSON envelope."
-            }, context.RequestAborted);
-            continue;
-        }
-
-        try
-        {
-            switch (clientEnvelope.Type)
-            {
-                case "start-session":
-                    if (string.IsNullOrWhiteSpace(clientEnvelope.SessionId))
-                    {
-                        await TrySendEnvelopeAsync(new ServerEnvelope { Type = "error", Message = "sessionId is required for start-session." }, context.RequestAborted);
-                        continue;
-                    }
-
-                    if (connectionSessions.TryGetValue(clientEnvelope.SessionId, out var existingConnectionSession))
-                    {
-                        logger.Warn(
-                            $"Rejected start-session because the sessionId is already active on this websocket. RequestedSessionId={clientEnvelope.SessionId} ActiveSessionId={existingConnectionSession.SessionId}");
-                        await TrySendEnvelopeAsync(new ServerEnvelope
-                        {
-                            Type = "error",
-                            SessionId = existingConnectionSession.SessionId,
-                            Message = "A session with this sessionId is already active on this connection."
-                        }, context.RequestAborted);
-                        continue;
-                    }
-
-                    WhisperTranscriberOptions sessionOptions;
-                    try
-                    {
-                        sessionOptions = WhisperModelCatalog.CreateSessionOptions(
-                            context.RequestServices.GetRequiredService<WhisperTranscriberOptions>(),
-                            clientEnvelope.ModelType,
-                            clientEnvelope.Prompt,
-                            clientEnvelope.Language,
-                            clientEnvelope.EnableLanguageDetection);
-                    }
-                    catch (InvalidOperationException ex)
-                    {
-                        await TrySendEnvelopeAsync(new ServerEnvelope
-                        {
-                            Type = "error",
-                            SessionId = clientEnvelope.SessionId,
-                            Message = ex.Message
-                        }, context.RequestAborted);
-                        continue;
-                    }
-
-                    SessionCreateResult createResult;
-                    try
-                    {
-                        createResult = await registry.TryCreateAsync(clientEnvelope.SessionId, sessionOptions, context.RequestAborted);
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.Error(
-                            $"Session warm-up failed. SessionId={clientEnvelope.SessionId} ModelType={sessionOptions.ModelType}",
-                            ex);
-                        await TrySendEnvelopeAsync(new ServerEnvelope
-                        {
-                            Type = "error",
-                            SessionId = clientEnvelope.SessionId,
-                            ModelType = sessionOptions.ModelType,
-                            Message = $"Unable to start session: {ex.Message}"
-                        }, context.RequestAborted);
-                        continue;
-                    }
-
-                    if (!createResult.Created || createResult.Session is null)
-                    {
-                        await TrySendEnvelopeAsync(new ServerEnvelope
-                        {
-                            Type = "error",
-                            SessionId = clientEnvelope.SessionId,
-                            ModelType = sessionOptions.ModelType,
-                            Message = createResult.RejectionReason ?? "Unable to create session."
-                        }, context.RequestAborted);
-                        continue;
-                    }
-
-                    var started = createResult.Session;
-                    var startedState = new ConnectionSessionState(
-                        started,
-                        ForwardSessionUpdatesAsync(started, TrySendEnvelopeAsync, logger, context.RequestAborted))
-                    {
-                        ActiveEncoding = NormalizeEncoding(clientEnvelope.Encoding),
-                        ActiveSampleRate = clientEnvelope.SampleRate,
-                        ActiveChannels = clientEnvelope.Channels
-                    };
-                    connectionSessions[started.SessionId] = startedState;
-                    var startedSnapshot = started.CreateSnapshot();
-                    logger.Info(
-                        $"Session started using client-provided sessionId. SessionId={started.SessionId} ModelType={started.ModelType} Encoding={clientEnvelope.Encoding ?? "<null>"} SampleRate={clientEnvelope.SampleRate?.ToString() ?? "<null>"} Channels={clientEnvelope.Channels?.ToString() ?? "<null>"} ConnectionSessionCount={connectionSessions.Count}");
-                    await TrySendEnvelopeAsync(new ServerEnvelope
-                    {
-                        Type = "session-started",
-                        SessionId = started.SessionId,
-                        Message = "Live transcription session started for the provided sessionId.",
-                        ModelType = started.ModelType,
-                        ReceivedChunkCount = startedSnapshot.ReceivedChunkCount,
-                        ReceivedAudioBytes = startedSnapshot.ReceivedAudioBytes,
-                    }, context.RequestAborted);
-                    break;
-
-                case "audio-chunk":
-                    var audioSession = await ResolveConnectionSessionAsync(clientEnvelope.SessionId, "audio-chunk", "No active session. Send start-session first.");
-                    if (audioSession is null)
-                    {
-                        continue;
-                    }
-
-                    if (string.IsNullOrWhiteSpace(clientEnvelope.AudioBase64))
-                    {
-                        await TrySendEnvelopeAsync(new ServerEnvelope { Type = "error", SessionId = audioSession.SessionId, Message = "audioBase64 is required for audio-chunk." }, context.RequestAborted);
-                        continue;
-                    }
-
-                    byte[] audioBytes;
-                    try
-                    {
-                        audioBytes = Convert.FromBase64String(clientEnvelope.AudioBase64);
-                    }
-                    catch (FormatException)
-                    {
-                        await TrySendEnvelopeAsync(new ServerEnvelope { Type = "error", SessionId = audioSession.SessionId, Message = "audioBase64 is not valid base64." }, context.RequestAborted);
-                        continue;
-                    }
-
-                    var resolvedEncoding = NormalizeEncoding(clientEnvelope.Encoding) ?? audioSession.ActiveEncoding ?? "f32le";
-                    var resolvedSampleRate = clientEnvelope.SampleRate ?? audioSession.ActiveSampleRate ?? 48000;
-                    var resolvedChannels = clientEnvelope.Channels ?? audioSession.ActiveChannels ?? 2;
-                    audioSession.ActiveEncoding = resolvedEncoding;
-                    audioSession.ActiveSampleRate = resolvedSampleRate;
-                    audioSession.ActiveChannels = resolvedChannels;
-
-                    await audioSession.Session.AddAudioChunkAsync(new AudioChunk(
-                        audioBytes,
-                        audioBytes.Length,
-                        resolvedSampleRate,
-                        resolvedChannels,
-                        resolvedEncoding,
-                        DateTimeOffset.UtcNow), context.RequestAborted);
-                    break;
-
-                case "simulate-text":
-                    var simulatedSession = await ResolveConnectionSessionAsync(clientEnvelope.SessionId, "simulate-text", "No active session. Send start-session first.");
-                    if (simulatedSession is null)
-                    {
-                        continue;
-                    }
-
-                    var simulatedFinalEvent = clientEnvelope.IsFinalChunk ?? true;
-                    logger.Warn($"Simulated transcript requested. SessionId={simulatedSession.SessionId} FinalEvent={simulatedFinalEvent}");
-                    await TrySendEnvelopeAsync(new ServerEnvelope
-                    {
-                        Type = simulatedFinalEvent ? "final-transcript" : "partial-transcript",
-                        SessionId = simulatedSession.SessionId,
-                        Message = "Simulated transcript event.",
-                        UtteranceId = $"{simulatedSession.SessionId}-simulated",
-                        Sequence = simulatedFinalEvent ? null : 1,
-                        TranscriptText = clientEnvelope.SimulatedText ?? string.Empty,
-                    }, context.RequestAborted);
-                    break;
-
-                case "end-session":
-                    logger.Info(
-                        $"Received end-session request. RequestedSessionId={clientEnvelope.SessionId ?? "<null>"} ActiveSessionCount={connectionSessions.Count}");
-                    var endingSession = await ResolveConnectionSessionAsync(clientEnvelope.SessionId, "end-session", "No active session to end.");
-                    if (endingSession is null)
-                    {
-                        continue;
-                    }
-
-                    var shutdownCompleted = await ShutdownConnectionSessionAsync(
-                        endingSession.SessionId,
-                        shutdownReason: "client-end-session",
-                        flushPendingAudio: true,
-                        sendSessionEnded: true,
-                        context.RequestAborted);
-                    if (!shutdownCompleted)
-                    {
-                        break;
-                    }
-                    break;
-
-                default:
-                    logger.Warn($"Unsupported client envelope type. Type={clientEnvelope.Type} SessionId={clientEnvelope.SessionId}");
-                    await TrySendEnvelopeAsync(new ServerEnvelope
-                    {
-                        Type = "error",
-                        SessionId = clientEnvelope.SessionId,
-                        Message = $"Unsupported message type: {clientEnvelope.Type}"
-                    }, context.RequestAborted);
-                    break;
-            }
-        }
-        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
-        {
-            logger.Warn($"Request aborted while processing websocket message. SessionId={clientEnvelope.SessionId}");
-            break;
-        }
-        catch (Exception ex)
-        {
-            logger.Error(
-                $"WebSocket message processing failed. Type={clientEnvelope.Type} SessionId={clientEnvelope.SessionId} Sequence={clientEnvelope.Sequence}",
-                ex);
-
-            if (socket.State == WebSocketState.Open)
-            {
-                await TrySendEnvelopeAsync(new ServerEnvelope
-                {
-                    Type = "error",
-                    SessionId = clientEnvelope.SessionId,
-                    Message = $"Server failed to process {clientEnvelope.Type}: {ex.Message}"
-                }, context.RequestAborted);
-
-                await socket.CloseAsync(WebSocketCloseStatus.InternalServerError, "server-processing-failed", context.RequestAborted);
-            }
-
-            break;
-        }
     }
-
-    if (connectionSessions.Count > 0)
+    catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
     {
-        var remainingSessionIds = connectionSessions.Keys.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
-        logger.Warn($"WebSocket handler exited with active sessions. ActiveSessionCount={remainingSessionIds.Length} ActiveSessionIds={FormatSessionIds(remainingSessionIds)}");
-        foreach (var sessionId in remainingSessionIds)
-        {
-            await ShutdownConnectionSessionAsync(
-                sessionId,
-                shutdownReason: "websocket-handler-exit",
-                flushPendingAudio: false,
-                sendSessionEnded: false,
-                CancellationToken.None);
-        }
+        logger.Warn($"WebSocket request aborted. ActiveSessionCount={connectionSessions.Count} ActiveSessionIds={FormatSessionIds(connectionSessions.Keys)}");
     }
+    catch (WebSocketException ex)
+    {
+        logger.Warn($"WebSocket transport failed. SocketState={socket.State} ActiveSessionCount={connectionSessions.Count} ActiveSessionIds={FormatSessionIds(connectionSessions.Keys)} ExceptionType={ex.GetType().Name} Message={ex.Message}");
+    }
+    finally
+    {
+        if (connectionSessions.Count > 0)
+        {
+            var remainingSessionIds = connectionSessions.Keys.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+            logger.Warn($"WebSocket handler exited with active sessions. ActiveSessionCount={remainingSessionIds.Length} ActiveSessionIds={FormatSessionIds(remainingSessionIds)}");
+            foreach (var sessionId in remainingSessionIds)
+            {
+                await ShutdownConnectionSessionAsync(
+                    sessionId,
+                    shutdownReason: "websocket-handler-exit",
+                    flushPendingAudio: false,
+                    sendSessionEnded: false,
+                    CancellationToken.None);
+            }
+        }
 
-    logger.Info($"WebSocket handler completed. FinalSocketState={socket.State} FinalSessionCount={connectionSessions.Count}");
+        logger.Info($"WebSocket handler completed. FinalSocketState={socket.State} FinalSessionCount={connectionSessions.Count}");
+    }
 
     async Task<bool> TrySendEnvelopeAsync(ServerEnvelope envelope, CancellationToken cancellationToken)
     {
