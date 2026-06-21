@@ -14,10 +14,12 @@ namespace AIO.Transcription.Server.Runtime;
 public sealed class LiveTranscriptionSession : IAsyncDisposable
 {
     private readonly object sync = new();
-    private readonly Channel<AudioChunk> inputChannel = Channel.CreateUnbounded<AudioChunk>(new UnboundedChannelOptions
+    private readonly Queue<AudioChunk> inputQueue = new();
+    private readonly Channel<bool> inputQueueSignal = Channel.CreateBounded<bool>(new BoundedChannelOptions(1)
     {
         SingleReader = true,
-        SingleWriter = false
+        SingleWriter = false,
+        FullMode = BoundedChannelFullMode.DropWrite
     });
     private readonly Channel<ServerEnvelope> updatesChannel = Channel.CreateUnbounded<ServerEnvelope>(new UnboundedChannelOptions
     {
@@ -48,9 +50,15 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
     private double currentUtterancePeakRms;
     private bool utteranceActive;
     private bool acceptingAudio = true;
+    private bool inputQueueCompleted;
     private bool flushPendingAudioOnCompletion;
     private Exception? processingFailure;
     private bool failureReported;
+    private double queuedAudioDurationMs;
+    private long queuedAudioBytes;
+    private long droppedQueuedAudioChunkCount;
+    private long droppedQueuedAudioBytes;
+    private double droppedQueuedAudioDurationMs;
     private long totalNormalizedSampleCount;
     private int utterancesStarted;
     private int utterancesFinalized;
@@ -89,15 +97,15 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
     public string SessionId { get; }
     public string ModelType { get; }
 
-    public async Task AddAudioChunkAsync(AudioChunk chunk, CancellationToken cancellationToken)
+    public Task AddAudioChunkAsync(AudioChunk chunk, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(chunk);
+        cancellationToken.ThrowIfCancellationRequested();
 
-        EnsureSessionIsAcceptingAudio();
-        await inputChannel.Writer.WriteAsync(chunk, cancellationToken);
-
+        AudioQueueDropSummary? dropSummary;
         lock (sync)
         {
+            EnsureSessionIsAcceptingAudioUnderLock();
             if (snapshot.ReceivedChunkCount > 0 &&
                 (!string.Equals(snapshot.LastEncoding, chunk.Encoding, StringComparison.OrdinalIgnoreCase) ||
                  snapshot.LastSampleRate != chunk.SampleRate ||
@@ -113,7 +121,12 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
             snapshot.LastEncoding = chunk.Encoding;
             snapshot.LastSampleRate = chunk.SampleRate;
             snapshot.LastChannels = chunk.Channels;
+            dropSummary = EnqueueLiveAudioChunkUnderLock(chunk);
         }
+
+        inputQueueSignal.Writer.TryWrite(true);
+        LogQueuedAudioDrop(dropSummary);
+        return Task.CompletedTask;
     }
 
     public IAsyncEnumerable<ServerEnvelope> ReadUpdatesAsync(CancellationToken cancellationToken)
@@ -127,9 +140,10 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         {
             flushPendingAudioOnCompletion |= flushPendingAudio;
             acceptingAudio = false;
+            inputQueueCompleted = true;
         }
 
-        inputChannel.Writer.TryComplete();
+        inputQueueSignal.Writer.TryWrite(true);
         await processingTask.WaitAsync(cancellationToken);
     }
 
@@ -160,10 +174,11 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         lock (sync)
         {
             acceptingAudio = false;
+            inputQueueCompleted = true;
         }
 
         lifetimeCts.Cancel();
-        inputChannel.Writer.TryComplete();
+        inputQueueSignal.Writer.TryWrite(true);
 
         try
         {
@@ -188,25 +203,22 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         lifetimeCts.Dispose();
     }
 
-    private void EnsureSessionIsAcceptingAudio()
+    private void EnsureSessionIsAcceptingAudioUnderLock()
     {
-        lock (sync)
+        if (processingFailure is not null)
         {
-            if (processingFailure is not null)
+            if (!failureReported)
             {
-                if (!failureReported)
-                {
-                    failureReported = true;
-                    throw new InvalidOperationException($"Session {SessionId} can no longer process audio.", processingFailure);
-                }
-
-                throw new InvalidOperationException($"Session {SessionId} can no longer process audio because transcription already failed.");
+                failureReported = true;
+                throw new InvalidOperationException($"Session {SessionId} can no longer process audio.", processingFailure);
             }
 
-            if (!acceptingAudio)
-            {
-                throw new InvalidOperationException($"Session {SessionId} is no longer accepting audio.");
-            }
+            throw new InvalidOperationException($"Session {SessionId} can no longer process audio because transcription already failed.");
+        }
+
+        if (!acceptingAudio)
+        {
+            throw new InvalidOperationException($"Session {SessionId} is no longer accepting audio.");
         }
     }
 
@@ -214,7 +226,7 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
     {
         try
         {
-            await foreach (var chunk in inputChannel.Reader.ReadAllAsync(lifetimeCts.Token))
+            while (await ReadNextQueuedAudioChunkAsync(lifetimeCts.Token) is { } chunk)
             {
                 var samples = WavePcm16Writer.DecodeMonoSamples(chunk, options.TargetSampleRate);
                 var chunkContainedSpeechFrame = await ProcessSamplesAsync(samples, lifetimeCts.Token);
@@ -251,6 +263,69 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
             LogSessionSummary();
             updatesChannel.Writer.TryComplete();
         }
+    }
+
+    private async Task<AudioChunk?> ReadNextQueuedAudioChunkAsync(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            lock (sync)
+            {
+                if (inputQueue.Count > 0)
+                {
+                    var chunk = inputQueue.Dequeue();
+                    var chunkDurationMs = EstimateQueuedChunkMilliseconds(chunk);
+                    queuedAudioDurationMs = Math.Max(0, queuedAudioDurationMs - chunkDurationMs);
+                    queuedAudioBytes = Math.Max(0, queuedAudioBytes - chunk.BytesRecorded);
+                    return chunk;
+                }
+
+                if (inputQueueCompleted)
+                {
+                    return null;
+                }
+            }
+
+            await inputQueueSignal.Reader.ReadAsync(cancellationToken);
+        }
+    }
+
+    private AudioQueueDropSummary? EnqueueLiveAudioChunkUnderLock(AudioChunk chunk)
+    {
+        var chunkDurationMs = EstimateQueuedChunkMilliseconds(chunk);
+        inputQueue.Enqueue(chunk);
+        queuedAudioDurationMs += chunkDurationMs;
+        queuedAudioBytes += chunk.BytesRecorded;
+
+        var droppedChunkCount = 0;
+        var droppedBytes = 0L;
+        var droppedDurationMs = 0.0;
+        while (inputQueue.Count > 1 && queuedAudioDurationMs > options.MaxQueuedAudioBufferMs)
+        {
+            var droppedChunk = inputQueue.Dequeue();
+            var droppedChunkDurationMs = EstimateQueuedChunkMilliseconds(droppedChunk);
+            queuedAudioDurationMs = Math.Max(0, queuedAudioDurationMs - droppedChunkDurationMs);
+            queuedAudioBytes = Math.Max(0, queuedAudioBytes - droppedChunk.BytesRecorded);
+            droppedChunkCount += 1;
+            droppedBytes += droppedChunk.BytesRecorded;
+            droppedDurationMs += droppedChunkDurationMs;
+        }
+
+        if (droppedChunkCount == 0)
+        {
+            return null;
+        }
+
+        droppedQueuedAudioChunkCount += droppedChunkCount;
+        droppedQueuedAudioBytes += droppedBytes;
+        droppedQueuedAudioDurationMs += droppedDurationMs;
+        return new AudioQueueDropSummary(
+            droppedChunkCount,
+            droppedBytes,
+            droppedDurationMs,
+            inputQueue.Count,
+            queuedAudioBytes,
+            queuedAudioDurationMs);
     }
 
     private async Task<bool> ProcessSamplesAsync(float[] samples, CancellationToken cancellationToken)
@@ -328,7 +403,7 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
             if (samplesSinceLastSpeech >= MillisecondsToSamples(10000))
             {
                 log.Warn(
-                    $"No speech detected yet for active session audio. SessionId={SessionId} ObservedMs={SamplesToMilliseconds(samplesSinceLastSpeech):F0} MaxObservedRms={maxObservedRmsSinceLastSpeech:F4} VadThreshold={options.VadEnergyThreshold:F4}");
+                    $"No speech detected yet for active session audio. SessionId={SessionId} ObservedMs={SamplesToMilliseconds(samplesSinceLastSpeech):F0} MaxObservedRms={maxObservedRmsSinceLastSpeech:F4} VadThreshold={options.VadEnergyThreshold:F4}{BuildNearThresholdHint(maxObservedRmsSinceLastSpeech)}");
                 samplesSinceLastSpeech = 0;
                 maxObservedRmsSinceLastSpeech = 0;
             }
@@ -619,6 +694,18 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         return samples * 1000.0 / options.TargetSampleRate;
     }
 
+    private static double EstimateQueuedChunkMilliseconds(AudioChunk chunk)
+    {
+        try
+        {
+            return WavePcm16Writer.EstimateChunkMilliseconds(chunk);
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
     private static double CalculateRms(ReadOnlySpan<float> samples)
     {
         if (samples.Length == 0)
@@ -646,6 +733,13 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         return peak;
     }
 
+    private string BuildNearThresholdHint(double observedRms)
+    {
+        return observedRms >= options.VadEnergyThreshold * 0.8
+            ? " NearThreshold=true Hint=Audio energy is close to the VAD threshold; lower Transcription:VadEnergyThreshold if speech should open an utterance."
+            : string.Empty;
+    }
+
     private void LogAudioChunkDiagnostics(AudioChunk chunk, float[] samples, bool chunkContainedSpeechFrame)
     {
         if (!options.EnableLiveDiagnostics || !options.LogAudioChunkDiagnostics)
@@ -654,8 +748,20 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         }
 
         var snapshotCopy = CreateSnapshot();
+        var queueSnapshot = GetInputQueueSnapshot();
         log.Info(
-            $"AudioChunkDiagnostics sessionId={SessionId} chunkIndex={snapshotCopy.ReceivedChunkCount} receivedChunkCount={snapshotCopy.ReceivedChunkCount} rawByteLength={chunk.BytesRecorded} normalizedSampleCount={samples.Length} normalizedDurationMs={SamplesToMilliseconds(samples.Length):F2} sampleRate={options.TargetSampleRate} rms={CalculateRms(samples):F6} peakAbsolute={CalculatePeakAbsolute(samples):F6} vadSpeechFrameDetected={chunkContainedSpeechFrame} rollingBufferDurationMs={SamplesToMilliseconds(rollingSamples.Count):F2} utteranceState={FormatUtteranceState(utteranceActive)}");
+            $"AudioChunkDiagnostics sessionId={SessionId} chunkIndex={snapshotCopy.ReceivedChunkCount} receivedChunkCount={snapshotCopy.ReceivedChunkCount} rawByteLength={chunk.BytesRecorded} normalizedSampleCount={samples.Length} normalizedDurationMs={SamplesToMilliseconds(samples.Length):F2} sampleRate={options.TargetSampleRate} rms={CalculateRms(samples):F6} peakAbsolute={CalculatePeakAbsolute(samples):F6} vadSpeechFrameDetected={chunkContainedSpeechFrame} rollingBufferDurationMs={SamplesToMilliseconds(rollingSamples.Count):F2} utteranceState={FormatUtteranceState(utteranceActive)} queuedAudioDurationMs={queueSnapshot.DurationMs:F2} queuedAudioChunkCount={queueSnapshot.ChunkCount} droppedQueuedAudioChunks={queueSnapshot.DroppedChunkCount} droppedQueuedAudioDurationMs={queueSnapshot.DroppedDurationMs:F2}");
+    }
+
+    private void LogQueuedAudioDrop(AudioQueueDropSummary? dropSummary)
+    {
+        if (dropSummary is null)
+        {
+            return;
+        }
+
+        log.Warn(
+            $"Dropped obsolete queued live audio. SessionId={SessionId} DroppedQueuedAudioChunks={dropSummary.DroppedChunkCount} DroppedQueuedAudioBytes={dropSummary.DroppedBytes} DroppedQueuedAudioDurationMs={dropSummary.DroppedDurationMs:F2} RemainingQueuedAudioChunks={dropSummary.RemainingChunkCount} RemainingQueuedAudioBytes={dropSummary.RemainingBytes} RemainingQueuedAudioDurationMs={dropSummary.RemainingDurationMs:F2} MaxQueuedAudioBufferMs={options.MaxQueuedAudioBufferMs}");
     }
 
     private void LogVadFrameDiagnostics(
@@ -816,7 +922,7 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         var minUtteranceDurationMs = completedUtteranceDurationsMs.Count == 0 ? 0 : completedUtteranceDurationsMs.Min();
         var maxUtteranceDurationMs = completedUtteranceDurationsMs.Count == 0 ? 0 : completedUtteranceDurationsMs.Max();
         log.Info(
-            $"LiveDiagnosticsSummary sessionId={SessionId} receivedChunkCount={snapshotCopy.ReceivedChunkCount} receivedAudioBytes={snapshotCopy.ReceivedAudioBytes} totalNormalizedAudioDurationMs={SamplesToMilliseconds(totalNormalizedSampleCount):F2} utterancesStarted={utterancesStarted} utterancesFinalized={utterancesFinalized} utterancesDropped={utterancesDropped} partialTranscriptsRequested={partialTranscriptsRequested} finalTranscriptsRequested={finalTranscriptsRequested} finalTranscriptsEmitted={finalTranscriptsEmitted} dropCountsByReason={FormatDropCounts()} averageUtteranceDurationMs={averageUtteranceDurationMs:F2} minUtteranceDurationMs={minUtteranceDurationMs:F2} maxUtteranceDurationMs={maxUtteranceDurationMs:F2} debugWavFilesWritten={debugUtteranceFilesWritten}");
+            $"LiveDiagnosticsSummary sessionId={SessionId} receivedChunkCount={snapshotCopy.ReceivedChunkCount} receivedAudioBytes={snapshotCopy.ReceivedAudioBytes} totalNormalizedAudioDurationMs={SamplesToMilliseconds(totalNormalizedSampleCount):F2} utterancesStarted={utterancesStarted} utterancesFinalized={utterancesFinalized} utterancesDropped={utterancesDropped} partialTranscriptsRequested={partialTranscriptsRequested} finalTranscriptsRequested={finalTranscriptsRequested} finalTranscriptsEmitted={finalTranscriptsEmitted} dropCountsByReason={FormatDropCounts()} averageUtteranceDurationMs={averageUtteranceDurationMs:F2} minUtteranceDurationMs={minUtteranceDurationMs:F2} maxUtteranceDurationMs={maxUtteranceDurationMs:F2} droppedQueuedAudioChunks={droppedQueuedAudioChunkCount} droppedQueuedAudioBytes={droppedQueuedAudioBytes} droppedQueuedAudioDurationMs={droppedQueuedAudioDurationMs:F2} debugWavFilesWritten={debugUtteranceFilesWritten}");
     }
 
     private string FormatDropCounts()
@@ -855,6 +961,20 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
         return string.IsNullOrWhiteSpace(sanitized) ? "unknown" : sanitized;
     }
 
+    private AudioQueueSnapshot GetInputQueueSnapshot()
+    {
+        lock (sync)
+        {
+            return new AudioQueueSnapshot(
+                inputQueue.Count,
+                queuedAudioBytes,
+                queuedAudioDurationMs,
+                droppedQueuedAudioChunkCount,
+                droppedQueuedAudioBytes,
+                droppedQueuedAudioDurationMs);
+        }
+    }
+
     private bool ShouldFlushPendingAudio()
     {
         lock (sync)
@@ -877,4 +997,20 @@ public sealed class LiveTranscriptionSession : IAsyncDisposable
             LastChannels = source.LastChannels,
         };
     }
+
+    private sealed record AudioQueueDropSummary(
+        int DroppedChunkCount,
+        long DroppedBytes,
+        double DroppedDurationMs,
+        int RemainingChunkCount,
+        long RemainingBytes,
+        double RemainingDurationMs);
+
+    private sealed record AudioQueueSnapshot(
+        int ChunkCount,
+        long Bytes,
+        double DurationMs,
+        long DroppedChunkCount,
+        long DroppedBytes,
+        double DroppedDurationMs);
 }

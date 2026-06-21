@@ -17,6 +17,7 @@ public sealed class WhisperTranscriberOptions
     public int PostRollMs { get; set; } = 700;
     public int VadFrameMs { get; set; } = 20;
     public double VadEnergyThreshold { get; set; } = 0.015;
+    public int MaxQueuedAudioBufferMs { get; set; } = 30000;
     public string TechnicalPrompt { get; set; } = string.Empty;
     public int? BufferWindowMilliseconds { get; set; }
     public int? MinimumWindowMilliseconds { get; set; }
@@ -54,6 +55,7 @@ public sealed class WhisperTranscriberOptions
             PostRollMs = PostRollMs,
             VadFrameMs = VadFrameMs,
             VadEnergyThreshold = VadEnergyThreshold,
+            MaxQueuedAudioBufferMs = MaxQueuedAudioBufferMs,
             TechnicalPrompt = TechnicalPrompt,
             BufferWindowMilliseconds = BufferWindowMilliseconds,
             MinimumWindowMilliseconds = MinimumWindowMilliseconds,
@@ -93,9 +95,9 @@ public sealed class WhisperTranscriberOptions
 
         if (PartialUpdateIntervalMs <= 0 || PartialWindowMs <= 0 || MinimumUtteranceMs <= 0 ||
             EndSilenceMs <= 0 || MaxUtteranceMs <= 0 || PreRollMs < 0 || PostRollMs < 0 ||
-            VadFrameMs <= 0 || VadEnergyThreshold <= 0)
+            VadFrameMs <= 0 || VadEnergyThreshold <= 0 || MaxQueuedAudioBufferMs <= 0)
         {
-            throw new InvalidOperationException("Live transcription timing and VAD settings must be positive, except PreRollMs and PostRollMs which may be zero.");
+            throw new InvalidOperationException("Live transcription timing, VAD, and queue settings must be positive, except PreRollMs and PostRollMs which may be zero.");
         }
 
         if (PartialUpdateIntervalMs > PartialWindowMs)

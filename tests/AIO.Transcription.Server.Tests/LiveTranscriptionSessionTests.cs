@@ -238,6 +238,74 @@ public sealed class LiveTranscriptionSessionTests
     }
 
     [Fact]
+    public async Task InputBufferDropsOldQueuedAudioWhenTranscriptionFallsBehind()
+    {
+        var transcriber = new BlockingOnceTranscriber();
+        var log = new RecordingLog<LiveTranscriptionSession>();
+        var options = CreateOptions();
+        options.EnableLiveDiagnostics = true;
+        options.PartialUpdateIntervalMs = 500;
+        options.PartialWindowMs = 2000;
+        options.MinimumUtteranceMs = 500;
+        options.MaxQueuedAudioBufferMs = 1000;
+        await using var session = CreateSession(transcriber, options, log);
+
+        await session.AddAudioChunkAsync(BuildChunk(amplitude: 0.1f, milliseconds: 500), CancellationToken.None);
+        await transcriber.FirstRequestStarted.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        for (var index = 0; index < 6; index += 1)
+        {
+            await session.AddAudioChunkAsync(BuildChunk(amplitude: 0.0f, milliseconds: 500), CancellationToken.None);
+        }
+
+        Assert.Contains(log.WarnMessages, x => x.Contains("Dropped obsolete queued live audio", StringComparison.Ordinal));
+
+        transcriber.CompleteFirstRequest("partial-after-backlog");
+        await session.CompleteAsync(flushPendingAudio: true, CancellationToken.None);
+
+        var updates = await ReadAllUpdatesAsync(session);
+        Assert.Contains(updates, x => x.Type == "final-transcript");
+        Assert.Contains(log.InfoMessages, x =>
+            x.Contains("LiveDiagnosticsSummary", StringComparison.Ordinal) &&
+            x.Contains("droppedQueuedAudioChunks=4", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task NearProductionAudioLevelStartsUtteranceWhenThresholdIsLowered()
+    {
+        var transcriber = new RecordingTranscriber();
+        var options = CreateOptions();
+        options.VadEnergyThreshold = 0.0035;
+        options.MinimumUtteranceMs = 500;
+        await using var session = CreateSession(transcriber, options);
+
+        await AddChunksAsync(session, amplitude: 0.0048f, chunkCount: 3);
+        await AddChunksAsync(session, amplitude: 0.0f, chunkCount: 2);
+        await session.CompleteAsync(flushPendingAudio: true, CancellationToken.None);
+
+        var updates = await ReadAllUpdatesAsync(session);
+        Assert.Contains(updates, x => x.Type == "final-transcript");
+    }
+
+    [Fact]
+    public async Task NoSpeechWarningIncludesNearThresholdHint()
+    {
+        var transcriber = new RecordingTranscriber();
+        var log = new RecordingLog<LiveTranscriptionSession>();
+        var options = CreateOptions();
+        options.VadEnergyThreshold = 0.005;
+        await using var session = CreateSession(transcriber, options, log);
+
+        await AddChunksAsync(session, amplitude: 0.0048f, chunkCount: 20);
+        await session.CompleteAsync(flushPendingAudio: true, CancellationToken.None);
+
+        Assert.Contains(log.WarnMessages, x =>
+            x.Contains("No speech detected yet", StringComparison.Ordinal) &&
+            x.Contains("NearThreshold=true", StringComparison.Ordinal) &&
+            x.Contains("Transcription:VadEnergyThreshold", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task MaxUtteranceForcesFinalization()
     {
         var transcriber = new RecordingTranscriber();
@@ -359,7 +427,10 @@ public sealed class LiveTranscriptionSessionTests
         Assert.Equal("server prompt" + Environment.NewLine + "client prompt", sessionOptions.TechnicalPrompt);
     }
 
-    private static LiveTranscriptionSession CreateSession(RecordingTranscriber transcriber, WhisperTranscriberOptions? options = null)
+    private static LiveTranscriptionSession CreateSession(
+        IWaveTranscriber transcriber,
+        WhisperTranscriberOptions? options = null,
+        ILogMachina<LiveTranscriptionSession>? log = null)
     {
         options ??= CreateOptions();
         options.Validate();
@@ -367,7 +438,7 @@ public sealed class LiveTranscriptionSessionTests
             "session-1",
             transcriber,
             options,
-            new NoOpLog<LiveTranscriptionSession>());
+            log ?? new NoOpLog<LiveTranscriptionSession>());
     }
 
     private static WhisperTranscriberOptions CreateOptions()
@@ -518,6 +589,43 @@ public sealed class LiveTranscriptionSessionTests
         }
     }
 
+    private sealed class BlockingOnceTranscriber : IWaveTranscriber
+    {
+        private readonly TaskCompletionSource<string> firstRequestResponse = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int requestCount;
+
+        public TaskCompletionSource FirstRequestStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public List<RecordedRequest> Requests { get; } = [];
+
+        public Task WarmUpAsync(CancellationToken cancellationToken)
+        {
+            return Task.CompletedTask;
+        }
+
+        public Task<string> TranscribeWaveAsync(WaveTranscriptionRequest request, CancellationToken cancellationToken)
+        {
+            var requestNumber = Interlocked.Increment(ref requestCount);
+            var durationMs = (request.WaveBytes.Length - 44) / 2 * 1000 / 16000;
+            lock (Requests)
+            {
+                Requests.Add(new RecordedRequest(durationMs, request.Prompt, request.Language, request.EnableLanguageDetection));
+            }
+
+            if (requestNumber == 1)
+            {
+                FirstRequestStarted.TrySetResult();
+                return firstRequestResponse.Task.WaitAsync(cancellationToken);
+            }
+
+            return Task.FromResult($"text-{requestNumber}");
+        }
+
+        public void CompleteFirstRequest(string text)
+        {
+            firstRequestResponse.TrySetResult(text);
+        }
+    }
+
     private sealed record RecordedRequest(int DurationMs, string? Prompt, string? Language, bool EnableLanguageDetection);
 
     private sealed class NoOpLog<T> : ILogMachina<T>
@@ -545,6 +653,56 @@ public sealed class LiveTranscriptionSessionTests
 
         public void Warn(string message)
         {
+        }
+    }
+
+    private sealed class RecordingLog<T> : ILogMachina<T>
+        where T : class
+    {
+        private readonly object sync = new();
+
+        public List<string> InfoMessages { get; } = [];
+        public List<string> WarnMessages { get; } = [];
+        public List<string> ErrorMessages { get; } = [];
+
+        public void Debug(string message)
+        {
+        }
+
+        public void Error(string message)
+        {
+            lock (sync)
+            {
+                ErrorMessages.Add(message);
+            }
+        }
+
+        public void Error(Exception ex)
+        {
+            lock (sync)
+            {
+                ErrorMessages.Add(ex.ToString());
+            }
+        }
+
+        public void Info(string message)
+        {
+            lock (sync)
+            {
+                InfoMessages.Add(message);
+            }
+        }
+
+        public void Trace(string message)
+        {
+        }
+
+        public void Warn(string message)
+        {
+            lock (sync)
+            {
+                WarnMessages.Add(message);
+            }
         }
     }
 }

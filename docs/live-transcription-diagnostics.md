@@ -24,6 +24,7 @@ Live diagnostics are off by default. Enable them under the existing `Transcripti
 - `LogAudioChunkDiagnostics`: logs one compact entry per received chunk after normalization, including RMS, peak sample value, VAD speech-frame presence, rolling buffer duration, and current utterance state.
 - `LogVadFrameDiagnostics`: logs frame-level VAD details. This is noisy and should stay off except during short targeted captures.
 - `LogUtteranceDiagnostics`: logs utterance lifecycle events such as speech start, partial requests, endpoint detection, drops, final transcription, and final event emission.
+- `MaxQueuedAudioBufferMs`: caps the pre-processing live audio queue. If the worker falls behind, older queued chunks are discarded and logged so the server keeps recent audio instead of stale backlog.
 - `SaveDebugUtteranceWavFiles`: writes WAV files for dropped or finalized utterances when diagnostics are enabled.
 - `DebugUtteranceDirectory`: root directory for debug artifacts.
 - `SaveDroppedUtterances`: writes WAV/JSON artifacts for dropped utterances when debug saving is enabled.
@@ -53,6 +54,8 @@ With `EnableLiveDiagnostics=true` and `LogUtteranceDiagnostics=true`, look for t
 - `FinalTranscriptEmitted`
 - `LiveDiagnosticsSummary`
 
+When the live input queue expires stale chunks, the server logs `Dropped obsolete queued live audio`. The session summary includes `droppedQueuedAudioChunks`, `droppedQueuedAudioBytes`, and `droppedQueuedAudioDurationMs`.
+
 `UtteranceDropped` reasons include:
 
 - `BelowMinimumUtteranceMs`: detected speech was shorter than `MinimumUtteranceMs`.
@@ -71,6 +74,8 @@ Case B: chunks have RMS and peak values, but VAD never opens an utterance.
 
 => `VadEnergyThreshold` is likely too high for the captured audio.
 
+If the no-speech warning includes `NearThreshold=true`, captured audio is close to the configured threshold. Lower `Transcription:VadEnergyThreshold` slightly and retest.
+
 Case C: an utterance opens, then logs `UtteranceDropped reason=BelowMinimumUtteranceMs`.
 
 => `MinimumUtteranceMs` is too high for short phrases, or VAD is only detecting a small part of the phrase.
@@ -82,3 +87,7 @@ Case D: the finalized debug WAV contains speech, but `FinalTranscriptReturned` h
 Case E: `FinalTranscriptEmitted` appears in server logs, but the client does not show the phrase.
 
 => The server emitted the `final-transcript` event. Investigate the client websocket receive loop, protocol handling, or UI accumulator.
+
+Case F: logs show `Dropped obsolete queued live audio`.
+
+=> The server fell behind and discarded stale queued chunks to preserve live behavior. Reduce Whisper latency, raise `MaxQueuedAudioBufferMs` cautiously, or accept that overload may skip obsolete audio.

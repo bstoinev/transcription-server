@@ -132,6 +132,9 @@ Fields:
 - `VadFrameMs`: `20`
 - `VadEnergyThreshold`: `0.015`
 - `PromptContextCharacters`: `256`
+- `MaxQueuedAudioBufferMs`: `30000`
+
+The server treats audio as a live stream. When the worker falls behind, queued audio older than `MaxQueuedAudioBufferMs` may be discarded before VAD/transcription so stale backlog does not grow without bound.
 
 ## Diagnostic Configuration
 

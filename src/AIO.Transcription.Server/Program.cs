@@ -634,28 +634,35 @@ static async Task ForwardSessionUpdatesAsync(
     ILogMachina<TranscriptionWebSocketEndpoint> logger,
     CancellationToken cancellationToken)
 {
-    await foreach (var update in session.ReadUpdatesAsync(cancellationToken))
+    try
     {
-        if (string.Equals(update.Type, "partial-transcript", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(update.Type, "final-transcript", StringComparison.OrdinalIgnoreCase))
+        await foreach (var update in session.ReadUpdatesAsync(cancellationToken))
         {
-            logger.Info(
-                $"Transcript update emitted. Type={update.Type} SessionId={update.SessionId} UtteranceId={update.UtteranceId ?? "<none>"} Sequence={update.Sequence?.ToString() ?? "<none>"} TranscriptChars={update.TranscriptText?.Length ?? 0} ReceivedChunkCount={update.ReceivedChunkCount ?? 0}");
-        }
-        else if (string.Equals(update.Type, "error", StringComparison.OrdinalIgnoreCase))
-        {
-            logger.Error($"Session update emitted error. SessionId={update.SessionId} Message={update.Message}");
-        }
-        else
-        {
-            logger.Info($"Session update emitted. Type={update.Type} SessionId={update.SessionId}");
-        }
+            if (string.Equals(update.Type, "partial-transcript", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(update.Type, "final-transcript", StringComparison.OrdinalIgnoreCase))
+            {
+                logger.Info(
+                    $"Transcript update emitted. Type={update.Type} SessionId={update.SessionId} UtteranceId={update.UtteranceId ?? "<none>"} Sequence={update.Sequence?.ToString() ?? "<none>"} TranscriptChars={update.TranscriptText?.Length ?? 0} ReceivedChunkCount={update.ReceivedChunkCount ?? 0}");
+            }
+            else if (string.Equals(update.Type, "error", StringComparison.OrdinalIgnoreCase))
+            {
+                logger.Error($"Session update emitted error. SessionId={update.SessionId} Message={update.Message}");
+            }
+            else
+            {
+                logger.Info($"Session update emitted. Type={update.Type} SessionId={update.SessionId}");
+            }
 
-        if (!await trySendEnvelopeAsync(update, cancellationToken))
-        {
-            logger.Warn($"Unable to send session update because the websocket is no longer open. SessionId={update.SessionId}");
-            break;
+            if (!await trySendEnvelopeAsync(update, cancellationToken))
+            {
+                logger.Warn($"Unable to send session update because the websocket is no longer open. SessionId={update.SessionId}");
+                break;
+            }
         }
+    }
+    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+    {
+        logger.Info($"Stopped forwarding session updates because the websocket/request was canceled. SessionId={session.SessionId}");
     }
 }
 
